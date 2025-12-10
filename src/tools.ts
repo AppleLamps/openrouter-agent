@@ -3,30 +3,151 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { createReadStream, statSync, existsSync } from 'fs';
 import readline from 'readline';
+import { z } from 'zod';
+import * as Diff from 'diff';
+
+// ============================================================================
+// ZOD SCHEMAS FOR TOOL VALIDATION
+// ============================================================================
+
+export const ReadFileSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    start_line: z.number().int().positive().optional(),
+    end_line: z.number().int().positive().optional(),
+});
+
+export const WriteFileSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    content: z.string(),
+});
+
+export const DeleteFileSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    recursive: z.boolean().optional().default(false),
+});
+
+export const MoveFileSchema = z.object({
+    source: z.string().min(1, 'Source path is required'),
+    destination: z.string().min(1, 'Destination path is required'),
+});
+
+export const GetFileInfoSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+});
+
+export const EditFileSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    old_text: z.string().min(1, 'old_text is required'),
+    new_text: z.string(),
+    replace_all: z.boolean().optional().default(false),
+});
+
+export const EditOperationSchema = z.object({
+    old_text: z.string().min(1, 'old_text is required'),
+    new_text: z.string(),
+});
+
+export const MultiEditFileSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    edits: z.array(EditOperationSchema).min(1, 'At least one edit is required'),
+});
+
+export const InsertAtLineSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    line_number: z.number().int().positive('Line number must be a positive integer'),
+    content: z.string(),
+    position: z.enum(['before', 'after']).optional().default('after'),
+});
+
+export const ExecuteCommandSchema = z.object({
+    command: z.string().min(1, 'Command is required'),
+    cwd: z.string().optional(),
+    timeout: z.number().int().positive().optional().default(60000),
+});
+
+export const ListDirectorySchema = z.object({
+    directory: z.string().min(1, 'Directory is required'),
+    recursive: z.boolean().optional().default(false),
+    show_size: z.boolean().optional().default(false),
+});
+
+export const FindFilesSchema = z.object({
+    pattern: z.string().min(1, 'Pattern is required'),
+    directory: z.string().min(1, 'Directory is required'),
+    max_results: z.number().int().positive().optional().default(50),
+});
+
+export const SearchFilesSchema = z.object({
+    pattern: z.string().min(1, 'Pattern is required'),
+    directory: z.string().min(1, 'Directory is required'),
+    regex: z.boolean().optional().default(false),
+    extensions: z.array(z.string()).optional(),
+});
+
+export const GetCurrentDirectorySchema = z.object({});
+
+// Schema map for validation
+export const toolSchemas: Record<string, z.ZodSchema> = {
+    read_file: ReadFileSchema,
+    write_file: WriteFileSchema,
+    delete_file: DeleteFileSchema,
+    move_file: MoveFileSchema,
+    get_file_info: GetFileInfoSchema,
+    edit_file: EditFileSchema,
+    multi_edit_file: MultiEditFileSchema,
+    insert_at_line: InsertAtLineSchema,
+    execute_command: ExecuteCommandSchema,
+    list_directory: ListDirectorySchema,
+    find_files: FindFilesSchema,
+    search_files: SearchFilesSchema,
+    get_current_directory: GetCurrentDirectorySchema,
+};
+
+// Validation helper that returns either validated args or an error string
+export function validateToolArgs(toolName: string, args: unknown): { success: true; data: any } | { success: false; error: string } {
+    const schema = toolSchemas[toolName];
+    if (!schema) {
+        return { success: false, error: `Unknown tool: ${toolName}` };
+    }
+
+    const result = schema.safeParse(args);
+    if (result.success) {
+        return { success: true, data: result.data };
+    } else {
+        const issues = result.error.issues;
+        const errorMessages = issues.map((issue) => `${String(issue.path.join('.') || 'root')}: ${issue.message}`);
+        return { success: false, error: `Validation failed for ${toolName}: ${errorMessages.join(', ')}` };
+    }
+}
 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
 function createDiff(oldContent: string, newContent: string, filePath: string): string {
-    const oldLines = oldContent.split('\n');
-    const newLines = newContent.split('\n');
-    const diff: string[] = [`--- ${filePath}`, `+++ ${filePath}`];
+    // Use the diff library for robust unified diff output
+    const patch = Diff.createTwoFilesPatch(
+        filePath,
+        filePath,
+        oldContent,
+        newContent,
+        'original',
+        'modified',
+        { context: 3 }
+    );
 
-    let i = 0, j = 0;
-    while (i < oldLines.length || j < newLines.length) {
-        if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
-            i++; j++;
-        } else if (j < newLines.length && (i >= oldLines.length || oldLines[i] !== newLines[j])) {
-            diff.push(`+${newLines[j]}`);
-            j++;
-        } else {
-            diff.push(`-${oldLines[i]}`);
-            i++;
-        }
+    // Check if there are actual changes
+    if (oldContent === newContent) {
+        return 'No changes';
     }
 
-    return diff.length > 2 ? diff.slice(0, 30).join('\n') + (diff.length > 30 ? '\n...(truncated)' : '') : 'No changes';
+    // Truncate if too long (keep first 50 lines of diff)
+    const lines = patch.split('\n');
+    if (lines.length > 50) {
+        return lines.slice(0, 50).join('\n') + `\n... (${lines.length - 50} more lines truncated)`;
+    }
+
+    return patch;
 }
 
 async function createBackup(filePath: string): Promise<string | null> {

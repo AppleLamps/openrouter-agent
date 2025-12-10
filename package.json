@@ -22,6 +22,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@types/diff": "^7.0.2",
+    "diff": "^8.0.2",
     "dotenv": "^17.2.3",
     "openai": "^6.10.0",
     "tsx": "^4.21.0",
