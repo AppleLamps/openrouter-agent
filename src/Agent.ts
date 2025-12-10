@@ -2,13 +2,60 @@ import OpenAI from 'openai';
 import fs from 'fs/promises';
 import path from 'path';
 import * as readline from 'readline';
-import { tools, availableTools, detectProjectType, validateToolArgs } from './tools';
+import ora, { Ora } from 'ora';
+import { highlight } from 'cli-highlight';
+import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap } from './tools';
 
 // Configuration
 const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
 const MAX_HISTORY_MESSAGES = 50;
 const MAX_CONTEXT_TOKENS = 100000; // Safe limit for context window
 const CHARS_PER_TOKEN = 4; // Rough approximation: 4 characters = 1 token
+
+// ============================================================================
+// OUTPUT FORMATTING HELPERS
+// ============================================================================
+
+/**
+ * Highlight code blocks in markdown text
+ */
+function formatResponseWithHighlighting(text: string): string {
+    // Match code blocks: ```language\ncode\n```
+    const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+
+    return text.replace(codeBlockRegex, (match, lang, code) => {
+        try {
+            const language = lang || 'plaintext';
+            const highlighted = highlight(code.trim(), { language, ignoreIllegals: true });
+            return `\n┌─ ${language} ${'─'.repeat(Math.max(0, 50 - language.length))}┐\n${highlighted}\n└${'─'.repeat(54)}┘\n`;
+        } catch {
+            // If highlighting fails, return original
+            return match;
+        }
+    });
+}
+
+/**
+ * Format tool call display
+ */
+function formatToolCall(name: string, args: any): string {
+    const argsStr = JSON.stringify(args, null, 2);
+    const lines = argsStr.split('\n');
+    const truncatedArgs = lines.length > 5
+        ? lines.slice(0, 5).join('\n') + '\n  ...'
+        : argsStr;
+    return `\n┌─ 🔧 Tool: ${name} ${'─'.repeat(Math.max(0, 45 - name.length))}┐\n${truncatedArgs}\n└${'─'.repeat(54)}┘`;
+}
+
+/**
+ * Format tool result display
+ */
+function formatToolResult(output: string, maxLength: number = 300): string {
+    const truncated = output.length > maxLength
+        ? output.slice(0, maxLength) + '\n... (truncated)'
+        : output;
+    return `\n┌─ 📋 Result ${'─'.repeat(43)}┐\n${truncated}\n└${'─'.repeat(54)}┘`;
+}
 
 interface TokenUsage {
     input: number;
@@ -33,6 +80,7 @@ export class Agent {
     private currentModel: string;
     private webSearchEnabled: boolean;
     private projectContext: string = '';
+    private projectMap: string = '';
     private _safeMode: boolean;
     private rl: readline.Interface | null = null;
 
@@ -144,21 +192,40 @@ You are a highly capable AI coding agent compatible with OpenRouter.
 You have access to the file system and can execute shell commands.
 Your goal is to help the user with coding tasks, debugging, and general questions.
 
-PROJECT CONTEXT:
+=== THINKING REQUIREMENT ===
+Before calling ANY tool, you MUST first output your reasoning in a <thought> block.
+This helps you plan and avoid mistakes. Example:
+
+<thought>
+The user wants to add a new function. I should:
+1. First read the file to understand the current structure
+2. Identify where the new function should be placed
+3. Use edit_file_by_lines for precise editing
+Let me start by reading the file with line numbers.
+</thought>
+
+Always think before acting. Never call a tool without a preceding <thought> block.
+
+=== PROJECT CONTEXT ===
 - Working Directory: ${process.cwd()}
 - Project Type: ${this.projectContext || 'Unknown'}
 
-AVAILABLE TOOLS:
+=== PROJECT STRUCTURE ===
+${this.projectMap || '(Project map not available)'}
+
+=== AVAILABLE TOOLS ===
 File Operations:
-- read_file: Read file content (supports line ranges for large files)
+- read_file: Read file content (supports line ranges, optional line numbers)
+- read_file_with_lines: Read file with line numbers always shown (use BEFORE editing)
 - write_file: Write to files (auto-creates directories, creates backup)
 - delete_file: Delete files or directories
 - move_file: Move or rename files
 - get_file_info: Get file metadata (size, line count, dates)
 
-Edit Operations:
-- edit_file: Find-and-replace edit (creates backup, shows diff)
-- multi_edit_file: Multiple edits in one operation
+Edit Operations (prefer line-based editing for safety):
+- edit_file_by_lines: Replace line range with new content (RECOMMENDED - safest)
+- edit_file: Find-and-replace edit (fallback if line numbers unknown)
+- multi_edit_file: Multiple find-and-replace edits in one operation
 - insert_at_line: Insert content at specific line number
 
 Search & Navigation:
@@ -170,12 +237,19 @@ Search & Navigation:
 System:
 - execute_command: Run shell commands (supports cwd, timeout)
 
-BEHAVIOR:
-- When editing files, prefer edit_file or multi_edit_file over write_file for targeted changes.
-- Use read_file with line ranges for large files.
-- Always explore the codebase before making changes.
-- Create backups are automatic - don't worry about data loss.
-- If a command fails, analyze the error and try to fix it.
+=== EDITING WORKFLOW ===
+1. Use read_file_with_lines to view the file with line numbers
+2. Identify the exact start_line and end_line you need to modify
+3. Use edit_file_by_lines with precise line numbers
+4. This is SAFER than string matching because it avoids partial matches
+
+=== BEHAVIOR RULES ===
+- ALWAYS output a <thought> block before any tool call
+- PREFER edit_file_by_lines over edit_file for targeted changes (more reliable)
+- Use read_file_with_lines before editing to see line numbers
+- Explore the codebase before making changes
+- Backups are created automatically - don't worry about data loss
+- If a command fails, analyze the error and try to fix it
 `;
     }
 
@@ -301,6 +375,14 @@ BEHAVIOR:
     async initialize(): Promise<void> {
         await this.loadHistory();
         this.projectContext = await detectProjectType();
+
+        // Generate project map for context
+        try {
+            this.projectMap = await generateProjectMap(process.cwd());
+            console.log('Project structure loaded.');
+        } catch (err) {
+            console.log('Could not generate project map.');
+        }
     }
 
     // ============================================================================
@@ -335,14 +417,22 @@ BEHAVIOR:
 
         let step = 0;
         const maxSteps = 15;
+        let spinner: Ora | null = null;
 
-        console.log('\nAgent response:');
+        console.log('');
 
         while (step < maxSteps) {
             step++;
             try {
                 // Build model name with :online suffix if web search enabled
                 const modelToUse = this.webSearchEnabled ? `${this.currentModel}:online` : this.currentModel;
+
+                // Start thinking spinner
+                spinner = ora({
+                    text: 'Thinking...',
+                    spinner: 'dots',
+                    color: 'cyan'
+                }).start();
 
                 const response = await this.callWithRetry(() =>
                     this.openai.chat.completions.create({
@@ -353,10 +443,19 @@ BEHAVIOR:
                     })
                 );
 
+                // Stop spinner when we start receiving response
+                let spinnerStopped = false;
+
                 let fullContent = '';
                 let toolCalls: any[] = [];
 
                 for await (const chunk of response) {
+                    // Stop spinner on first content
+                    if (!spinnerStopped && spinner) {
+                        spinner.stop();
+                        spinnerStopped = true;
+                    }
+
                     const delta = chunk.choices[0]?.delta;
 
                     if (delta?.content) {
@@ -409,7 +508,7 @@ BEHAVIOR:
                             functionArgs = {};
                         }
 
-                        console.log(`\n[Tool Call] ${functionName}(${JSON.stringify(functionArgs)})`);
+                        console.log(formatToolCall(functionName, functionArgs));
 
                         let toolOutput: string;
 
@@ -424,18 +523,31 @@ BEHAVIOR:
                                 if (!confirmed) {
                                     toolOutput = 'User denied this operation. Please ask for user consent before retrying, or try a different approach.';
                                 } else {
+                                    // Show execution spinner
+                                    const execSpinner = ora({
+                                        text: `Executing ${functionName}...`,
+                                        spinner: 'dots',
+                                        color: 'yellow'
+                                    }).start();
                                     toolOutput = await availableTools[functionName](validation.data);
+                                    execSpinner.stop();
                                 }
                             } else {
+                                // Show execution spinner for non-dangerous tools
+                                const execSpinner = ora({
+                                    text: `Executing ${functionName}...`,
+                                    spinner: 'dots',
+                                    color: 'green'
+                                }).start();
                                 toolOutput = await availableTools[functionName](validation.data);
+                                execSpinner.stop();
                             }
                         } else {
                             toolOutput = `Error: Tool ${functionName} not found.`;
                         }
 
-                        // Truncate very long outputs for display
-                        const displayOutput = toolOutput.length > 200 ? toolOutput.slice(0, 200) + '...' : toolOutput;
-                        console.log(`\n[Tool Result] ${displayOutput}`);
+                        // Display formatted result
+                        console.log(formatToolResult(toolOutput));
 
                         const toolMessage = {
                             role: 'tool',
@@ -450,11 +562,20 @@ BEHAVIOR:
                     // No tools called, we are done
                     messages.push(assistantMessage);
                     this.conversationHistory.push(assistantMessage);
-                    console.log('\n');
+
+                    // Apply syntax highlighting to code blocks in final response
+                    if (fullContent) {
+                        const hasCodeBlocks = fullContent.includes('```');
+                        if (hasCodeBlocks) {
+                            console.log('\n' + formatResponseWithHighlighting(fullContent));
+                        }
+                    }
+                    console.log('');
                     break;
                 }
             } catch (error: any) {
-                console.error('\nError during API call:', error.message || error);
+                if (spinner) spinner.stop();
+                console.error('\n❌ Error during API call:', error.message || error);
                 break;
             }
         }

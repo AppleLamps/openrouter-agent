@@ -14,6 +14,13 @@ export const ReadFileSchema = z.object({
     path: z.string().min(1, 'Path is required'),
     start_line: z.number().int().positive().optional(),
     end_line: z.number().int().positive().optional(),
+    show_line_numbers: z.boolean().optional().default(false),
+});
+
+export const ReadFileWithLinesSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    start_line: z.number().int().positive().optional(),
+    end_line: z.number().int().positive().optional(),
 });
 
 export const WriteFileSchema = z.object({
@@ -59,6 +66,13 @@ export const InsertAtLineSchema = z.object({
     position: z.enum(['before', 'after']).optional().default('after'),
 });
 
+export const EditFileByLinesSchema = z.object({
+    path: z.string().min(1, 'Path is required'),
+    start_line: z.number().int().positive('Start line must be a positive integer'),
+    end_line: z.number().int().positive('End line must be a positive integer'),
+    new_content: z.string(),
+});
+
 export const ExecuteCommandSchema = z.object({
     command: z.string().min(1, 'Command is required'),
     cwd: z.string().optional(),
@@ -89,11 +103,13 @@ export const GetCurrentDirectorySchema = z.object({});
 // Schema map for validation
 export const toolSchemas: Record<string, z.ZodSchema> = {
     read_file: ReadFileSchema,
+    read_file_with_lines: ReadFileWithLinesSchema,
     write_file: WriteFileSchema,
     delete_file: DeleteFileSchema,
     move_file: MoveFileSchema,
     get_file_info: GetFileInfoSchema,
     edit_file: EditFileSchema,
+    edit_file_by_lines: EditFileByLinesSchema,
     multi_edit_file: MultiEditFileSchema,
     insert_at_line: InsertAtLineSchema,
     execute_command: ExecuteCommandSchema,
@@ -162,10 +178,148 @@ async function createBackup(filePath: string): Promise<string | null> {
 }
 
 // ============================================================================
+// PROJECT MAP GENERATOR
+// ============================================================================
+
+/**
+ * Load and parse .gitignore patterns from a directory
+ */
+async function loadGitignorePatterns(dir: string): Promise<string[]> {
+    const patterns: string[] = [];
+    try {
+        const gitignorePath = path.join(dir, '.gitignore');
+        if (existsSync(gitignorePath)) {
+            const content = await fs.readFile(gitignorePath, 'utf-8');
+            const lines = content.split('\n');
+            for (const line of lines) {
+                const trimmed = line.trim();
+                // Skip comments and empty lines
+                if (trimmed && !trimmed.startsWith('#')) {
+                    patterns.push(trimmed);
+                }
+            }
+        }
+    } catch { }
+    return patterns;
+}
+
+/**
+ * Check if a file/directory should be ignored based on patterns
+ */
+function shouldIgnore(name: string, patterns: string[]): boolean {
+    // Always ignore these
+    const alwaysIgnore = [
+        'node_modules', '.git', '.svn', '.hg',
+        'dist', 'build', 'out', '.next', '.nuxt',
+        '__pycache__', '.pytest_cache', '.mypy_cache',
+        'coverage', '.nyc_output',
+        '.DS_Store', 'Thumbs.db',
+        '*.bak', '.env', '.env.*',
+    ];
+
+    for (const pattern of alwaysIgnore) {
+        if (pattern.startsWith('*.')) {
+            // Extension pattern
+            if (name.endsWith(pattern.slice(1))) return true;
+        } else if (pattern.endsWith('.*')) {
+            // Prefix pattern
+            if (name.startsWith(pattern.slice(0, -2))) return true;
+        } else {
+            if (name === pattern) return true;
+        }
+    }
+
+    // Check gitignore patterns
+    for (const pattern of patterns) {
+        // Simple pattern matching (not full glob)
+        const cleanPattern = pattern.replace(/^\//, '').replace(/\/$/, '');
+        if (name === cleanPattern) return true;
+        if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
+    }
+
+    return false;
+}
+
+/**
+ * Generate a tree-like project map string
+ */
+export async function generateProjectMap(dir: string, maxDepth: number = 4, maxFiles: number = 100): Promise<string> {
+    const gitignorePatterns = await loadGitignorePatterns(dir);
+    const lines: string[] = [];
+    let fileCount = 0;
+    let truncated = false;
+
+    async function walkDir(currentDir: string, prefix: string, depth: number): Promise<void> {
+        if (depth > maxDepth || fileCount >= maxFiles) {
+            truncated = true;
+            return;
+        }
+
+        try {
+            const entries = await fs.readdir(currentDir, { withFileTypes: true });
+
+            // Sort: directories first, then files, both alphabetically
+            const sorted = entries.sort((a, b) => {
+                if (a.isDirectory() && !b.isDirectory()) return -1;
+                if (!a.isDirectory() && b.isDirectory()) return 1;
+                return a.name.localeCompare(b.name);
+            });
+
+            // Filter ignored entries
+            const filtered = sorted.filter(e => !shouldIgnore(e.name, gitignorePatterns));
+
+            for (let i = 0; i < filtered.length; i++) {
+                if (fileCount >= maxFiles) {
+                    truncated = true;
+                    break;
+                }
+
+                const entry = filtered[i];
+                const isLast = i === filtered.length - 1;
+                const connector = isLast ? '└── ' : '├── ';
+                const childPrefix = isLast ? '    ' : '│   ';
+
+                if (entry.isDirectory()) {
+                    lines.push(`${prefix}${connector}📁 ${entry.name}/`);
+                    fileCount++;
+                    await walkDir(
+                        path.join(currentDir, entry.name),
+                        prefix + childPrefix,
+                        depth + 1
+                    );
+                } else {
+                    // Add file with type indicator
+                    const ext = path.extname(entry.name).toLowerCase();
+                    let icon = '📄';
+                    if (['.ts', '.tsx', '.js', '.jsx'].includes(ext)) icon = '📜';
+                    else if (['.json', '.yaml', '.yml', '.toml'].includes(ext)) icon = '⚙️';
+                    else if (['.md', '.txt', '.rst'].includes(ext)) icon = '📝';
+                    else if (['.css', '.scss', '.less'].includes(ext)) icon = '🎨';
+                    else if (['.html', '.htm'].includes(ext)) icon = '🌐';
+
+                    lines.push(`${prefix}${connector}${icon} ${entry.name}`);
+                    fileCount++;
+                }
+            }
+        } catch { }
+    }
+
+    const dirName = path.basename(dir) || dir;
+    lines.push(`📂 ${dirName}/`);
+    await walkDir(dir, '', 1);
+
+    if (truncated) {
+        lines.push(`\n... (truncated at ${maxFiles} items or depth ${maxDepth})`);
+    }
+
+    return lines.join('\n');
+}
+
+// ============================================================================
 // FILE OPERATIONS
 // ============================================================================
 
-async function readFile({ path: filePath, start_line, end_line }: { path: string; start_line?: number; end_line?: number }) {
+async function readFile({ path: filePath, start_line, end_line, show_line_numbers = false }: { path: string; start_line?: number; end_line?: number; show_line_numbers?: boolean }) {
     try {
         if (start_line !== undefined || end_line !== undefined) {
             // Read specific lines
@@ -180,7 +334,11 @@ async function readFile({ path: filePath, start_line, end_line }: { path: string
             for await (const line of rl) {
                 lineNum++;
                 if (lineNum >= start && lineNum <= end) {
-                    lines.push(`${lineNum}: ${line}`);
+                    if (show_line_numbers) {
+                        lines.push(`${lineNum} | ${line}`);
+                    } else {
+                        lines.push(line);
+                    }
                 }
                 if (lineNum > end) break;
             }
@@ -189,9 +347,117 @@ async function readFile({ path: filePath, start_line, end_line }: { path: string
         }
 
         const content = await fs.readFile(filePath, 'utf-8');
+        if (show_line_numbers) {
+            const lines = content.split('\n');
+            return lines.map((line, i) => `${i + 1} | ${line}`).join('\n');
+        }
         return content;
     } catch (error: any) {
         return `Error reading file: ${error.message}`;
+    }
+}
+
+/**
+ * Read file with line numbers always shown - helps the LLM target specific lines for editing.
+ * Format: "1 | import..." for easy parsing
+ */
+async function readFileWithLines({ path: filePath, start_line, end_line }: { path: string; start_line?: number; end_line?: number }) {
+    try {
+        const fileStream = createReadStream(filePath);
+        const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+        const lines: string[] = [];
+        let lineNum = 0;
+        let totalLines = 0;
+        const start = start_line || 1;
+        const end = end_line || Infinity;
+
+        for await (const line of rl) {
+            lineNum++;
+            totalLines++;
+            if (lineNum >= start && lineNum <= end) {
+                // Pad line numbers for alignment (up to 9999 lines)
+                const paddedNum = String(lineNum).padStart(4, ' ');
+                lines.push(`${paddedNum} | ${line}`);
+            }
+            if (lineNum > end && end !== Infinity) break;
+        }
+
+        if (lines.length === 0) {
+            return `No lines in specified range (file has ${totalLines} lines)`;
+        }
+
+        // Add file info header
+        const rangeInfo = start_line || end_line
+            ? `Lines ${start}-${Math.min(end, totalLines)} of ${totalLines}`
+            : `All ${totalLines} lines`;
+
+        return `File: ${filePath}\n${rangeInfo}\n${'─'.repeat(60)}\n${lines.join('\n')}`;
+    } catch (error: any) {
+        return `Error reading file: ${error.message}`;
+    }
+}
+
+/**
+ * Edit file by replacing a range of lines with new content.
+ * This is safer than string matching because it uses explicit line numbers.
+ */
+async function editFileByLines({ path: filePath, start_line, end_line, new_content }: {
+    path: string;
+    start_line: number;
+    end_line: number;
+    new_content: string
+}) {
+    try {
+        // Validate line range
+        if (start_line > end_line) {
+            return `Error: start_line (${start_line}) must be <= end_line (${end_line})`;
+        }
+
+        // Read original content
+        const originalContent = await fs.readFile(filePath, 'utf-8');
+        const originalLines = originalContent.split('\n');
+        const totalLines = originalLines.length;
+
+        // Validate line numbers
+        if (start_line < 1) {
+            return `Error: start_line must be >= 1 (got ${start_line})`;
+        }
+        if (end_line > totalLines) {
+            return `Error: end_line (${end_line}) exceeds file length (${totalLines} lines)`;
+        }
+
+        // Create backup
+        await createBackup(filePath);
+
+        // Split new content into lines (handle empty content = delete lines)
+        const newLines = new_content === '' ? [] : new_content.split('\n');
+
+        // Build new file content
+        const resultLines = [
+            ...originalLines.slice(0, start_line - 1),  // Lines before the range
+            ...newLines,                                  // New content
+            ...originalLines.slice(end_line)              // Lines after the range
+        ];
+
+        const newContent = resultLines.join('\n');
+        await fs.writeFile(filePath, newContent, 'utf-8');
+
+        // Generate diff
+        const diff = createDiff(originalContent, newContent, filePath);
+
+        // Summary
+        const linesRemoved = end_line - start_line + 1;
+        const linesAdded = newLines.length;
+        const lineDelta = linesAdded - linesRemoved;
+        const deltaStr = lineDelta >= 0 ? `+${lineDelta}` : `${lineDelta}`;
+
+        return `Edited ${filePath}\n` +
+            `Replaced lines ${start_line}-${end_line} (${linesRemoved} lines) with ${linesAdded} lines (${deltaStr} net)\n` +
+            `New file has ${resultLines.length} lines\n\n` +
+            `Diff:\n${diff}`;
+    } catch (error: any) {
+        return `Error editing file: ${error.message}`;
     }
 }
 
@@ -564,6 +830,23 @@ export const tools = [
                     path: { type: 'string', description: 'The path to the file to read.' },
                     start_line: { type: 'number', description: 'Optional: Start reading from this line (1-indexed).' },
                     end_line: { type: 'number', description: 'Optional: Stop reading at this line (inclusive).' },
+                    show_line_numbers: { type: 'boolean', description: 'Optional: If true, prefix each line with its line number (e.g., "1 | code"). Default: false.' },
+                },
+                required: ['path'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'read_file_with_lines',
+            description: 'Read file content with line numbers always shown. Output format: "   1 | code...". Use this BEFORE editing to identify exact line numbers for edit_file_by_lines.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'The path to the file to read.' },
+                    start_line: { type: 'number', description: 'Optional: Start reading from this line (1-indexed).' },
+                    end_line: { type: 'number', description: 'Optional: Stop reading at this line (inclusive).' },
                 },
                 required: ['path'],
             },
@@ -765,6 +1048,23 @@ export const tools = [
             },
         },
     },
+    {
+        type: 'function',
+        function: {
+            name: 'edit_file_by_lines',
+            description: 'Replace a range of lines with new content. SAFER than string matching. Use read_file_with_lines first to identify exact line numbers. Supports deleting lines (empty new_content) or replacing with different number of lines.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string', description: 'The path to the file to edit.' },
+                    start_line: { type: 'number', description: 'First line to replace (1-indexed, inclusive).' },
+                    end_line: { type: 'number', description: 'Last line to replace (1-indexed, inclusive).' },
+                    new_content: { type: 'string', description: 'The new content to insert. Can be empty to delete lines, or multiple lines (use \\n).' },
+                },
+                required: ['path', 'start_line', 'end_line', 'new_content'],
+            },
+        },
+    },
 ];
 
 // ============================================================================
@@ -773,11 +1073,13 @@ export const tools = [
 
 export const availableTools: Record<string, Function> = {
     read_file: readFile,
+    read_file_with_lines: readFileWithLines,
     write_file: writeFile,
     delete_file: deleteFile,
     move_file: moveFile,
     get_file_info: getFileInfo,
     edit_file: editFile,
+    edit_file_by_lines: editFileByLines,
     multi_edit_file: multiEditFile,
     insert_at_line: insertAtLine,
     execute_command: executeCommand,
