@@ -71,7 +71,17 @@ interface AgentConfig {
 }
 
 // Tools that require user confirmation in safe mode
-const DANGEROUS_TOOLS = ['execute_command', 'delete_file', 'write_file', 'move_file'];
+// Includes all tools that can modify files or execute arbitrary commands
+const DANGEROUS_TOOLS = [
+    'execute_command',
+    'delete_file',
+    'write_file',
+    'move_file',
+    'edit_file',
+    'edit_file_by_lines',
+    'multi_edit_file',
+    'insert_at_line',
+];
 
 export class Agent {
     private openai: OpenAI;
@@ -482,6 +492,8 @@ System:
                     }
 
                     // Track usage if available
+                    // Note: OpenRouter sends usage in the final chunk only when streaming,
+                    // so we accumulate but typically only receive one usage object per response
                     if ((chunk as any).usage) {
                         const usage = (chunk as any).usage;
                         this.totalTokens.input += usage.prompt_tokens || 0;

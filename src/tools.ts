@@ -613,6 +613,9 @@ async function insertAtLine({ path: filePath, line_number, content: insertConten
 // COMMAND EXECUTION
 // ============================================================================
 
+// Maximum characters to keep from command output (prevents memory issues)
+const MAX_OUTPUT_LENGTH = 50000;
+
 async function executeCommand({ command, cwd, timeout = 60000 }: { command: string; cwd?: string; timeout?: number }): Promise<string> {
     return new Promise((resolve) => {
         console.log('\n[Command Output]');
@@ -622,6 +625,7 @@ async function executeCommand({ command, cwd, timeout = 60000 }: { command: stri
         });
         let output = '';
         let timedOut = false;
+        let truncatedWarning = false;
 
         const timer = setTimeout(() => {
             timedOut = true;
@@ -633,19 +637,34 @@ async function executeCommand({ command, cwd, timeout = 60000 }: { command: stri
             const text = data.toString();
             process.stdout.write(text);
             output += text;
+            // Cap output to prevent memory issues, keeping most recent
+            if (output.length > MAX_OUTPUT_LENGTH) {
+                output = output.slice(-MAX_OUTPUT_LENGTH);
+                if (!truncatedWarning) {
+                    truncatedWarning = true;
+                }
+            }
         });
 
         child.stderr.on('data', (data: Buffer) => {
             const text = data.toString();
             process.stderr.write(text);
             output += `[stderr] ${text}`;
+            // Cap output to prevent memory issues
+            if (output.length > MAX_OUTPUT_LENGTH) {
+                output = output.slice(-MAX_OUTPUT_LENGTH);
+                if (!truncatedWarning) {
+                    truncatedWarning = true;
+                }
+            }
         });
 
         child.on('close', (code) => {
             clearTimeout(timer);
             if (!timedOut) {
                 console.log(`\n[Exit Code: ${code}]`);
-                resolve(output || `Command completed with exit code ${code}`);
+                const prefix = truncatedWarning ? '[Output truncated to last 50KB]\n' : '';
+                resolve(prefix + output || `Command completed with exit code ${code}`);
             }
         });
 
