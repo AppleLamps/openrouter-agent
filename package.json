@@ -8,7 +8,9 @@
     "ora": "./bin/cli.js"
   },
   "scripts": {
-    "start": "tsx src/index.ts",
+    "prestart": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
     "build": "tsc",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
