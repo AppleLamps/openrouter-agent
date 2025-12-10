@@ -17,7 +17,7 @@ agent.setReadlineInterface(rl);
 // COMMAND HANDLERS
 // ============================================================================
 
-function handleCommand(input: string): boolean {
+async function handleCommand(input: string): Promise<boolean> {
     const parts = input.trim().split(/\s+/);
     const cmd = parts[0].toLowerCase();
 
@@ -51,10 +51,19 @@ function handleCommand(input: string): boolean {
             return true;
 
         case '/safe':
-            agent.safeMode = !agent.safeMode;
-            console.log(agent.safeMode
-                ? chalk.green('✓ Safe mode: ENABLED (will prompt for dangerous operations)')
-                : chalk.yellow('⚠ Safe mode: DISABLED'));
+            const newLevel = agent.cycleSafetyLevel();
+            const levelDescriptions = {
+                'full': chalk.green('FULL - prompts for all file changes'),
+                'delete-only': chalk.yellow('DELETE-ONLY - only prompts for delete/execute'),
+                'off': chalk.red('OFF - no prompts (dangerous!)')
+            };
+            console.log(`Safety level: ${levelDescriptions[newLevel]}`);
+            return true;
+
+        case '/refresh':
+            console.log(chalk.cyan('Refreshing project structure...'));
+            await agent.refreshProjectMap();
+            console.log(chalk.green('✓ Project structure refreshed.'));
             return true;
 
         case '/help':
@@ -62,11 +71,17 @@ function handleCommand(input: string): boolean {
 ${chalk.bold.cyan('Available Commands:')}
   ${chalk.yellow('/model')} ${chalk.dim('[name]')}  - Show or set current model
   ${chalk.yellow('/web')}           - Toggle web search (appends :online)
-  ${chalk.yellow('/safe')}          - Toggle safe mode (prompts before dangerous ops)
+  ${chalk.yellow('/safe')}          - Cycle safety: full → delete-only → off
   ${chalk.yellow('/tokens')}        - Show token usage for this session
   ${chalk.yellow('/clear')}         - Clear conversation history
+  ${chalk.yellow('/refresh')}       - Refresh project structure map
   ${chalk.yellow('/help')}          - Show this help message
   ${chalk.yellow('exit')}           - Quit the agent
+
+${chalk.bold.cyan('Safety Levels:')}
+  ${chalk.green('full')}        - Prompts for all file modifications
+  ${chalk.yellow('delete-only')} - Only prompts for delete and execute commands
+  ${chalk.red('off')}         - No prompts (use with caution!)
             `);
             return true;
 
@@ -90,7 +105,9 @@ async function startREPL() {
     console.log('');
     console.log(chalk.dim('┌─────────────────────────────────────────────────────┐'));
     console.log(chalk.dim('│') + ` ${chalk.cyan('Model:')}     ${chalk.white(agent.model.padEnd(40))}` + chalk.dim('│'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Safe Mode:')} ${agent.safeMode ? chalk.green('ENABLED'.padEnd(40)) : chalk.yellow('DISABLED'.padEnd(40))}` + chalk.dim('│'));
+    const safetyColors = { 'full': chalk.green, 'delete-only': chalk.yellow, 'off': chalk.red };
+    const safetyLabel = safetyColors[agent.safetyLevel](agent.safetyLevel.toUpperCase().padEnd(40));
+    console.log(chalk.dim('│') + ` ${chalk.cyan('Safety:')}    ${safetyLabel}` + chalk.dim('│'));
     console.log(chalk.dim('│') + ` ${chalk.cyan('Project:')}   ${chalk.white((agent.getProjectContext() || 'Unknown').slice(0, 40).padEnd(40))}` + chalk.dim('│'));
     console.log(chalk.dim('│') + ` ${chalk.cyan('Directory:')} ${chalk.white(process.cwd().slice(-40).padEnd(40))}` + chalk.dim('│'));
     console.log(chalk.dim('└─────────────────────────────────────────────────────┘'));
@@ -109,7 +126,7 @@ async function startREPL() {
             }
 
             if (trimmed.startsWith('/')) {
-                handleCommand(trimmed);
+                await handleCommand(trimmed);
             } else if (trimmed) {
                 await agent.run(trimmed);
             }

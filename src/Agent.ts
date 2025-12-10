@@ -36,15 +36,41 @@ function formatResponseWithHighlighting(text: string): string {
 }
 
 /**
- * Format tool call display
+ * Format tool call display - shows concise summary, not raw args
  */
 function formatToolCall(name: string, args: any): string {
-    const argsStr = JSON.stringify(args, null, 2);
-    const lines = argsStr.split('\n');
-    const truncatedArgs = lines.length > 5
-        ? lines.slice(0, 5).join('\n') + '\n  ...'
-        : argsStr;
-    return `\n┌─ 🔧 Tool: ${name} ${'─'.repeat(Math.max(0, 45 - name.length))}┐\n${truncatedArgs}\n└${'─'.repeat(54)}┘`;
+    let summary = '';
+
+    // Create human-readable summaries for common tools
+    switch (name) {
+        case 'write_file':
+            summary = `  path: "${args.path}"\n  content: ${args.content?.length || 0} characters`;
+            break;
+        case 'edit_file':
+            const oldPreview = (args.old_text || '').slice(0, 40).replace(/\n/g, '\\n');
+            summary = `  path: "${args.path}"\n  replacing: "${oldPreview}${args.old_text?.length > 40 ? '...' : ''}"`;
+            break;
+        case 'edit_file_by_lines':
+            summary = `  path: "${args.path}"\n  lines: ${args.start_line}-${args.end_line}\n  new_content: ${args.new_content?.length || 0} chars`;
+            break;
+        case 'execute_command':
+            const cmd = args.command?.length > 60 ? args.command.slice(0, 57) + '...' : args.command;
+            summary = `  command: "${cmd}"${args.cwd ? `\n  cwd: "${args.cwd}"` : ''}`;
+            break;
+        case 'read_file':
+        case 'read_file_with_lines':
+            summary = `  path: "${args.path}"${args.start_line ? `\n  lines: ${args.start_line}-${args.end_line || 'end'}` : ''}`;
+            break;
+        default:
+            // For other tools, show truncated JSON
+            const argsStr = JSON.stringify(args, null, 2);
+            const lines = argsStr.split('\n');
+            summary = lines.length > 4
+                ? lines.slice(0, 4).map(l => l.length > 60 ? l.slice(0, 57) + '...' : l).join('\n') + '\n  ...'
+                : lines.map(l => l.length > 60 ? l.slice(0, 57) + '...' : l).join('\n');
+    }
+
+    return `\n┌─ 🔧 Tool: ${name} ${'─'.repeat(Math.max(0, 45 - name.length))}┐\n${summary}\n└${'─'.repeat(54)}┘`;
 }
 
 /**
@@ -66,12 +92,19 @@ interface AgentConfig {
     model?: string;
     webSearchEnabled?: boolean;
     apiKey?: string;
-    safeMode?: boolean;
+    safetyLevel?: 'off' | 'delete-only' | 'full';
     readlineInterface?: readline.Interface;
 }
 
-// Tools that require user confirmation in safe mode
-// Includes all tools that can modify files or execute arbitrary commands
+// Safety levels:
+// 'full' - prompt for all dangerous operations (default)
+// 'delete-only' - only prompt for delete and execute_command (most destructive)
+// 'off' - no prompts (dangerous!)
+
+// Critical tools - ALWAYS prompt unless safety is 'off'
+const CRITICAL_TOOLS = ['delete_file', 'execute_command'];
+
+// All dangerous tools - prompt in 'full' safety mode
 const DANGEROUS_TOOLS = [
     'execute_command',
     'delete_file',
@@ -91,13 +124,13 @@ export class Agent {
     private webSearchEnabled: boolean;
     private projectContext: string = '';
     private projectMap: string = '';
-    private _safeMode: boolean;
+    private _safetyLevel: 'off' | 'delete-only' | 'full';
     private rl: readline.Interface | null = null;
 
     constructor(config: AgentConfig = {}) {
         this.currentModel = config.model || process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free';
         this.webSearchEnabled = config.webSearchEnabled || false;
-        this._safeMode = config.safeMode !== undefined ? config.safeMode : true;
+        this._safetyLevel = config.safetyLevel || 'full';
         this.rl = config.readlineInterface || null;
 
         this.openai = new OpenAI({
@@ -138,12 +171,22 @@ export class Agent {
         return this.projectContext;
     }
 
-    get safeMode(): boolean {
-        return this._safeMode;
+    get safetyLevel(): 'off' | 'delete-only' | 'full' {
+        return this._safetyLevel;
     }
 
-    set safeMode(value: boolean) {
-        this._safeMode = value;
+    set safetyLevel(value: 'off' | 'delete-only' | 'full') {
+        this._safetyLevel = value;
+    }
+
+    /**
+     * Cycle through safety levels: full -> delete-only -> off -> full
+     */
+    cycleSafetyLevel(): 'off' | 'delete-only' | 'full' {
+        const levels: Array<'off' | 'delete-only' | 'full'> = ['full', 'delete-only', 'off'];
+        const currentIndex = levels.indexOf(this._safetyLevel);
+        this._safetyLevel = levels[(currentIndex + 1) % levels.length];
+        return this._safetyLevel;
     }
 
     setReadlineInterface(rl: readline.Interface): void {
@@ -155,37 +198,97 @@ export class Agent {
     // ============================================================================
 
     private async confirmDangerousAction(toolName: string, args: any): Promise<boolean> {
-        if (!this.rl) {
-            console.log('\n[Warning] No readline interface available for confirmation. Denying action.');
-            return false;
+        // Build a concise, human-readable summary based on tool type
+        let operationType = '';
+        let targetPath = '';
+        let details = '';
+
+        switch (toolName) {
+            case 'write_file':
+                operationType = '📝 CREATE/OVERWRITE FILE';
+                targetPath = args.path || 'unknown';
+                const contentLength = args.content?.length || 0;
+                details = `${contentLength} characters`;
+                break;
+            case 'edit_file':
+                operationType = '✏️  EDIT FILE';
+                targetPath = args.path || 'unknown';
+                details = `Replace "${(args.old_text || '').slice(0, 30)}${args.old_text?.length > 30 ? '...' : ''}"`;
+                break;
+            case 'edit_file_by_lines':
+                operationType = '✏️  EDIT FILE (by lines)';
+                targetPath = args.path || 'unknown';
+                details = `Lines ${args.start_line}-${args.end_line}`;
+                break;
+            case 'multi_edit_file':
+                operationType = '✏️  MULTI-EDIT FILE';
+                targetPath = args.path || 'unknown';
+                details = `${args.edits?.length || 0} edit(s)`;
+                break;
+            case 'insert_at_line':
+                operationType = '➕ INSERT AT LINE';
+                targetPath = args.path || 'unknown';
+                details = `Line ${args.line_number} (${args.position || 'after'})`;
+                break;
+            case 'delete_file':
+                operationType = '🗑️  DELETE';
+                targetPath = args.path || 'unknown';
+                details = args.recursive ? 'Recursive' : 'Single file';
+                break;
+            case 'move_file':
+                operationType = '📦 MOVE/RENAME';
+                targetPath = `${args.source} → ${args.destination}`;
+                details = '';
+                break;
+            case 'execute_command':
+                operationType = '⚡ EXECUTE COMMAND';
+                targetPath = args.cwd || process.cwd();
+                // Show the command but truncate if too long
+                const cmd = args.command || '';
+                details = cmd.length > 50 ? cmd.slice(0, 47) + '...' : cmd;
+                break;
+            default:
+                operationType = `🔧 ${toolName.toUpperCase()}`;
+                targetPath = args.path || '';
+                details = '';
         }
 
+        console.log('');
+        console.log('┌────────────────────────────────────────────────────────────┐');
+        console.log('│  ⚠️   DANGEROUS OPERATION - Confirmation Required          │');
+        console.log('├────────────────────────────────────────────────────────────┤');
+        console.log(`│  Operation: ${operationType.padEnd(46)}│`);
+
+        // Handle long paths by truncating
+        const displayPath = targetPath.length > 50
+            ? '...' + targetPath.slice(-47)
+            : targetPath;
+        console.log(`│  Target:    ${displayPath.padEnd(46)}│`);
+
+        if (details) {
+            const displayDetails = details.length > 46
+                ? details.slice(0, 43) + '...'
+                : details;
+            console.log(`│  Details:   ${displayDetails.padEnd(46)}│`);
+        }
+
+        console.log('└────────────────────────────────────────────────────────────┘');
+
+        // Create a fresh readline interface for the confirmation prompt
+        // This avoids conflicts with the main REPL readline
         return new Promise((resolve) => {
-            console.log('\n┌─────────────────────────────────────────────────────────────┐');
-            console.log('│  ⚠️  DANGEROUS OPERATION - User Confirmation Required       │');
-            console.log('├─────────────────────────────────────────────────────────────┤');
-            console.log(`│  Tool: ${toolName.padEnd(52)}│`);
-            console.log('│  Arguments:                                                 │');
+            const confirmRl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+            });
 
-            // Display args in a readable format
-            const argsStr = JSON.stringify(args, null, 2);
-            const argsLines = argsStr.split('\n');
-            for (const line of argsLines.slice(0, 10)) {
-                const truncatedLine = line.length > 57 ? line.slice(0, 54) + '...' : line;
-                console.log(`│    ${truncatedLine.padEnd(56)}│`);
-            }
-            if (argsLines.length > 10) {
-                console.log(`│    ... (${argsLines.length - 10} more lines)`.padEnd(62) + '│');
-            }
-
-            console.log('└─────────────────────────────────────────────────────────────┘');
-
-            this.rl!.question('Allow this operation? (y/yes to confirm, any other key to deny): ', (answer) => {
-                const confirmed = answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes';
+            confirmRl.question('Allow? (y/yes to confirm): ', (answer) => {
+                confirmRl.close();
+                const confirmed = answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes';
                 if (confirmed) {
-                    console.log('[✓] Operation approved by user');
+                    console.log('✓ Approved\n');
                 } else {
-                    console.log('[✗] Operation denied by user');
+                    console.log('✗ Denied\n');
                 }
                 resolve(confirmed);
             });
@@ -387,6 +490,13 @@ System:
         this.projectContext = await detectProjectType();
 
         // Generate project map for context
+        await this.refreshProjectMap();
+    }
+
+    /**
+     * Regenerate the project map (useful after file changes)
+     */
+    async refreshProjectMap(): Promise<void> {
         try {
             this.projectMap = await generateProjectMap(process.cwd());
             console.log('Project structure loaded.');
@@ -529,8 +639,17 @@ System:
                         if (!validation.success) {
                             toolOutput = validation.error;
                         } else if (availableTools[functionName]) {
-                            // Check if this is a dangerous tool and safeMode is enabled
-                            if (this._safeMode && DANGEROUS_TOOLS.includes(functionName)) {
+                            // Determine if we need confirmation based on safety level
+                            let needsConfirmation = false;
+
+                            if (this._safetyLevel === 'full' && DANGEROUS_TOOLS.includes(functionName)) {
+                                needsConfirmation = true;
+                            } else if (this._safetyLevel === 'delete-only' && CRITICAL_TOOLS.includes(functionName)) {
+                                needsConfirmation = true;
+                            }
+                            // 'off' = no confirmation needed
+
+                            if (needsConfirmation) {
                                 const confirmed = await this.confirmDangerousAction(functionName, validation.data);
                                 if (!confirmed) {
                                     toolOutput = 'User denied this operation. Please ask for user consent before retrying, or try a different approach.';
@@ -545,7 +664,7 @@ System:
                                     execSpinner.stop();
                                 }
                             } else {
-                                // Show execution spinner for non-dangerous tools
+                                // Show execution spinner for auto-approved tools
                                 const execSpinner = ora({
                                     text: `Executing ${functionName}...`,
                                     spinner: 'dots',
