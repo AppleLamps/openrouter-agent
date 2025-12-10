@@ -1,13 +1,9 @@
 #!/usr/bin/env node
-import { spawnSync } from 'child_process';
+// bin/cli.js
+import { join } from 'path';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname } from 'path';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Run the TypeScript source directly using tsx
-spawnSync('npx', ['tsx', join(__dirname, '..', 'src', 'index.ts')], {
-    stdio: 'inherit',
-    shell: true,
-});
+// Point to the compiled JS file instead of TS source
+const __dirname = dirname(fileURLToPath(import.meta.url));
+import(join(__dirname, '..', 'dist', 'index.js'));
