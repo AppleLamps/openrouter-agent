@@ -7,17 +7,21 @@ A powerful, multi-tool AI coding assistant that runs in your terminal. Built wit
 ## ✨ Features
 
 - **🔌 OpenRouter Integration** — Access any LLM via a single API
-- **🔧 13 Built-in Tools** — File operations, code editing, search, and command execution
-- **🔄 Multi-step Reasoning** — Agent autonomously chains tools to complete tasks
+- **🔧 15 Built-in Tools** — File operations, code editing, search, and command execution
+- **🔄 Multi-step Reasoning** — Agent autonomously chains tools to complete tasks (up to 15 steps, with option to continue)
+- **🛡️ Safety Confirmations** — Prompts for user approval before dangerous operations (writes, deletes, commands)
 - **🌐 Web Search** — Toggle real-time web access with `/web`
 - **💾 Persistent History** — Conversations saved across sessions
 - **⌨️ Tab Completion** — Press Tab to autocomplete commands
 - **📜 REPL History** — Arrow up/down to recall previous prompts (persisted across sessions)
 - **🔁 Auto-retry** — Exponential backoff for API errors
 - **📁 Project Detection** — Auto-detects Node.js, Python, Rust, Go, and more
+- **🗺️ Project Map** — Generates and caches a tree view of your project structure
 - **💿 Automatic Backups** — Creates `.bak` files before edits
 - **📊 Colour-coded Diffs** — Green for additions, red for deletions
+- **🎨 Syntax Highlighting** — Code blocks in responses are syntax highlighted
 - **💰 Token Usage Display** — Shows token count after each request
+- **📏 Context Management** — Automatic token estimation and history trimming
 - **🐛 Debug Mode** — Toggle with `/debug` to see API payloads
 - **⚡ Graceful Shutdown** — Ctrl+C saves history and exits cleanly
 
@@ -27,19 +31,21 @@ A powerful, multi-tool AI coding assistant that runs in your terminal. Built wit
 
 | Category | Tool | Description |
 |----------|------|-------------|
-| **File Ops** | `read_file` | Read content (supports line ranges) |
-| | `write_file` | Create/update files (auto-creates dirs) |
+| **File Ops** | `read_file` | Read content (supports line ranges, optional line numbers) |
+| | `read_file_with_lines` | Read with line numbers always shown (use before editing) |
+| | `write_file` | Create/update files (auto-creates dirs, creates backup) |
 | | `delete_file` | Delete files or directories |
 | | `move_file` | Move or rename files |
 | | `get_file_info` | Get metadata (size, lines, dates) |
-| **Editing** | `edit_file` | Find-and-replace with diff output |
-| | `multi_edit_file` | Batch edits in one operation |
+| **Editing** | `edit_file_by_lines` | Replace line range with new content (RECOMMENDED - safest) |
+| | `edit_file` | Find-and-replace with diff output |
+| | `multi_edit_file` | Batch find-and-replace edits in one operation |
 | | `insert_at_line` | Insert content at specific line |
 | **Search** | `list_directory` | List files (recursive, show sizes) |
-| | `find_files` | Find by glob pattern (`*.ts`) |
-| | `search_files` | Search text (regex, filter by ext) |
+| | `find_files` | Find by glob pattern (`*.ts`, `test*`) |
+| | `search_files` | Search text (regex, filter by extension) |
 | | `get_current_directory` | Get working directory |
-| **System** | `execute_command` | Run shell commands (cwd, timeout) |
+| **System** | `execute_command` | Run shell commands (cwd, timeout, real-time output) |
 
 ---
 
@@ -111,6 +117,14 @@ ora
 │ Directory: C:\Users\lucas\my-project                   │
 └─────────────────────────────────────────────────────────┘
 
+┌─ Status Indicators ─────────────────────────────────────┐
+│ 🧠 Thinking   - Processing your request                │
+│ │ ...        - Streaming response text                  │
+│ 🔧 Tool       - Calling a tool/function                 │
+│ ⚡ Executing  - Running tool operation                  │
+│ ✓ Complete   - Task finished successfully               │
+└─────────────────────────────────────────────────────────┘
+
 Type /help for commands, exit to quit. Press Tab for autocomplete.
 
 ↩︎ 
@@ -128,47 +142,79 @@ Type /help for commands, exit to quit. Press Tab for autocomplete.
 | `/config` | | Show current configuration |
 | `/clear` | `/c` | Clear conversation history |
 | `/cls` | | Clear the terminal screen |
-| `/refresh` | | Refresh project structure map |
+| `/refresh` | | Refresh project structure map (bypasses cache) |
 | `/map` | | View the current project structure |
 | `/debug` | | Toggle debug mode (show API payloads) |
 | `/help` | `/h` | Show help |
 | `exit` | | Quit |
+
+### Safety Levels
+
+The agent prompts for user confirmation before executing potentially dangerous operations:
+
+| Level | Description |
+|-------|-------------|
+| **full** (default) | Prompts for all file modifications (write, edit, delete, move, execute) |
+| **delete-only** | Only prompts for delete and execute commands |
+| **off** | No prompts (use with extreme caution!) |
+
+Toggle with `/safe` command.
 
 ### Tips
 
 - Press **Tab** to autocomplete commands
 - Use **↑/↓** arrows to browse command history
 - Press **Ctrl+C** for graceful shutdown (saves all history)
+- When the agent reaches 15 steps, it asks if you want to continue
 
 ### Example Session
 
 ```
 ↩︎ Create a Python script that fetches weather data and save it to weather.py
 
-🔧 write_file
+┌─ 🔧 write_file ───────────────────────────────────────┐
   path: "weather.py"
   size: 342 characters
+└───────────────────────────────────────────────────────┘
 
-📋 Result
+┌────────────────────────────────────────────────────────────┐
+│  ⚠️   DANGEROUS OPERATION - Confirmation Required          │
+├────────────────────────────────────────────────────────────┤
+│  Operation: 📝 CREATE/OVERWRITE FILE                       │
+│  Target:    weather.py                                     │
+│  Details:   342 characters                                 │
+└────────────────────────────────────────────────────────────┘
+Allow? (y/yes to confirm): y
+✓ Approved
+
+┌─ 📋 Result ───────────────────────────────────────────┐
 Successfully wrote to weather.py
+└───────────────────────────────────────────────────────┘
 
 📊 Tokens: 1,234 in / 567 out
 ✓ Complete (2s | 1 tool used)
 
 ↩︎ Edit weather.py to add error handling
 
-🔧 edit_file
-  path: "weather.py"  
-  find: "response = requests.get(url)..."
+┌─ 🔧 edit_file_by_lines ───────────────────────────────┐
+  path: "weather.py"
+  lines: 5-8
+  size: 156 chars
+└───────────────────────────────────────────────────────┘
 
-📋 Result
-Edited weather.py: replaced 1 occurrence(s)
+┌─ 📋 Result ───────────────────────────────────────────┐
+Edited weather.py
+Replaced lines 5-8 (4 lines) with 7 lines (+3 net)
 
+Diff:
 -response = requests.get(url)
 +try:
 +    response = requests.get(url)
++    response.raise_for_status()
 +except Exception as e:
 +    print(f'Error: {e}')
++    sys.exit(1)
+└───────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -178,16 +224,36 @@ Edited weather.py: replaced 1 occurrence(s)
 ```
 openrouter-agent/
 ├── bin/
-│   └── cli.js          # CLI entry point
+│   └── cli.js          # CLI entry point (for npm link)
 ├── src/
-│   ├── index.ts        # Main agent logic
-│   └── tools.ts        # Tool definitions
+│   ├── index.ts        # REPL loop and command handlers
+│   ├── Agent.ts        # Core agent class (API calls, tool dispatch, safety)
+│   └── tools.ts        # Tool implementations and schemas (Zod validation)
+├── dist/               # Compiled JavaScript (generated)
 ├── .env                # Your API key (gitignored)
 ├── .env.example        # Example config
+├── .agent_history.json # Conversation history (gitignored)
+├── .ora_history        # REPL command history (gitignored)
 ├── package.json
 ├── tsconfig.json
 └── README.md
 ```
+
+---
+
+## 🏗️ Architecture
+
+The agent is built with a clean separation of concerns:
+
+- **`Agent` class** (`Agent.ts`) — Manages conversation history, API calls, streaming, tool dispatch, and safety confirmations
+- **Tools** (`tools.ts`) — Pure functions for file operations, editing, search, and command execution with Zod schema validation
+- **REPL** (`index.ts`) — Thin entry point handling user input, commands, and the main loop
+
+Key features:
+- **Streaming responses** — See output as it's generated
+- **Zod validation** — All tool arguments are validated before execution
+- **Automatic context management** — History is trimmed to stay under token limits
+- **Project map caching** — 5-minute TTL to avoid regenerating on every request
 
 ---
 
