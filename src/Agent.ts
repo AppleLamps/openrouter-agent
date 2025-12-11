@@ -523,16 +523,29 @@ export class Agent {
 
         console.log('└────────────────────────────────────────────────────────────┘');
 
+        // Pause the main readline if it exists to prevent double input
+        if (this.rl) {
+            this.rl.pause();
+        }
+
         // Create a fresh readline interface for the confirmation prompt
-        // This avoids conflicts with the main REPL readline
         return new Promise((resolve) => {
             const confirmRl = readline.createInterface({
                 input: process.stdin,
                 output: process.stdout,
+                terminal: false, // Disable terminal features to prevent echo issues
             });
 
-            confirmRl.question('Allow? (y/yes to confirm): ', (answer) => {
+            process.stdout.write('Allow? (y/yes to confirm): ');
+
+            confirmRl.once('line', (answer) => {
                 confirmRl.close();
+
+                // Resume the main readline
+                if (this.rl) {
+                    this.rl.resume();
+                }
+
                 const confirmed = answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes';
                 if (confirmed) {
                     console.log('✓ Approved\n');
@@ -540,6 +553,38 @@ export class Agent {
                     console.log('✗ Denied\n');
                 }
                 resolve(confirmed);
+            });
+        });
+    }
+
+    /**
+     * Ask user if they want to continue after reaching max steps
+     */
+    private async askContinue(): Promise<boolean> {
+        // Pause the main readline if it exists to prevent double input
+        if (this.rl) {
+            this.rl.pause();
+        }
+
+        return new Promise((resolve) => {
+            const confirmRl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: false,
+            });
+
+            process.stdout.write(chalk.yellow('Continue? (y/yes to continue): '));
+
+            confirmRl.once('line', (answer) => {
+                confirmRl.close();
+
+                // Resume the main readline
+                if (this.rl) {
+                    this.rl.resume();
+                }
+
+                const shouldContinue = answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes';
+                resolve(shouldContinue);
             });
         });
     }
@@ -803,13 +848,28 @@ System:
         const messages: any[] = this.prepareMessagesForAPI();
 
         const maxSteps = 15;
+        let currentStepInSession = 0;
 
         // Initialize status tracking for this request
         this.status.startRequest();
         console.log('');
 
-        while (this.status.getStep() < maxSteps) {
+        while (true) {
+            currentStepInSession++;
             this.status.incrementStep();
+
+            // Check if we've hit max steps for this session
+            if (currentStepInSession > maxSteps) {
+                console.log(chalk.yellow(`\n⚠️ Reached maximum steps (${maxSteps}). Task may be incomplete.`));
+                const shouldContinue = await this.askContinue();
+                if (shouldContinue) {
+                    console.log(chalk.green('✓ Continuing...\n'));
+                    currentStepInSession = 1; // Reset counter for new session
+                } else {
+                    console.log(chalk.dim('Stopped by user.\n'));
+                    break;
+                }
+            }
             this.status.showStepHeader();
 
             try {
@@ -993,11 +1053,6 @@ System:
                 this.status.setState('error', error.message || 'Unknown error');
                 break;
             }
-        }
-
-        // Check if we hit max steps
-        if (this.status.getStep() >= maxSteps) {
-            console.log(chalk.yellow(`\n⚠️ Reached maximum steps (${maxSteps}). Task may be incomplete.`));
         }
 
         await this.saveHistory();
