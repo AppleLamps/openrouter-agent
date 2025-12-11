@@ -27,7 +27,7 @@ function validateEnvironment(): void {
 validateEnvironment();
 
 // Available commands for tab-completion
-const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', 'exit'];
+const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', '/plan', '/run', 'exit'];
 
 // History file path
 const HISTORY_PATH = path.join(process.cwd(), '.ora_history');
@@ -148,6 +148,32 @@ async function handleCommand(input: string): Promise<boolean> {
             console.log(`Debug mode: ${debugState ? chalk.green('ON') : chalk.yellow('OFF')}`);
             return true;
 
+        case '/plan':
+            const planTask = parts.slice(1).join(' ');
+            if (!planTask) {
+                if (agent.hasPendingPlan) {
+                    const pending = agent.getPendingPlan();
+                    console.log(chalk.cyan('\nPending Plan:'));
+                    console.log(chalk.dim(`Task: ${pending?.task}`));
+                    console.log(chalk.dim(`Use ${chalk.yellow('/run')} to execute, or ${chalk.yellow('/plan <new task>')} to create a new plan.`));
+                } else {
+                    console.log(chalk.yellow('Usage: /plan <task description>'));
+                    console.log(chalk.dim('  Example: /plan Add input validation to the API endpoints'));
+                }
+            } else {
+                await agent.plan(planTask);
+            }
+            return true;
+
+        case '/run':
+            if (agent.hasPendingPlan) {
+                await agent.executePlan();
+            } else {
+                console.log(chalk.yellow('No pending plan to execute.'));
+                console.log(chalk.dim('  Use /plan <task> to create a plan first.'));
+            }
+            return true;
+
         case '/h':
         case '/help':
             console.log(`
@@ -163,8 +189,15 @@ ${chalk.bold.cyan('Available Commands:')}
   ${chalk.yellow('/refresh')}       - Refresh project structure map
   ${chalk.yellow('/map')}           - View the current project structure
   ${chalk.yellow('/debug')}         - Toggle debug mode (show API payloads)
+  ${chalk.yellow('/plan')} ${chalk.dim('<task>')}  - Create execution plan (read-only exploration)
+  ${chalk.yellow('/run')}           - Execute the pending plan
   ${chalk.yellow('/help')} ${chalk.dim('(/h)')}     - Show this help message
   ${chalk.yellow('exit')}           - Quit the agent
+
+${chalk.bold.cyan('Planning Workflow:')}
+  ${chalk.dim('1.')} /plan Add logging to all API routes
+  ${chalk.dim('2.')} Review the generated plan
+  ${chalk.dim('3.')} /run to execute, or /plan again for a different approach
 
 ${chalk.bold.cyan('Safety Levels:')}
   ${chalk.green('full')}        - Prompts for all file modifications

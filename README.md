@@ -24,7 +24,8 @@ A powerful, multi-tool AI coding assistant that runs in your terminal. Built wit
 - **📏 Context Management** — Automatic token estimation and history trimming
 - **🐛 Debug Mode** — Toggle with `/debug` to see API payloads and hidden errors
 - **⚡ Graceful Shutdown** — Ctrl+C saves history and exits cleanly
-- **🧪 Unit Tests** — 55+ tests covering security validators and core logic (Vitest)
+- **🧪 Unit Tests** — 58+ tests covering security validators and core logic (Vitest)
+- **📋 Planning Mode** — Use `/plan` to explore codebase (read-only) and create execution plans before running
 
 ---
 
@@ -154,8 +155,59 @@ Type /help for commands, exit to quit. Press Tab for autocomplete.
 | `/refresh` | | Refresh project structure map (bypasses cache) |
 | `/map` | | View the current project structure |
 | `/debug` | | Toggle debug mode (show API payloads) |
+| `/plan <task>` | | Create execution plan with read-only exploration |
+| `/run` | | Execute the pending plan |
 | `/help` | `/h` | Show help |
 | `exit` | | Quit |
+
+### Planning Mode
+
+The `/plan` command enables a two-phase workflow for complex tasks:
+
+1. **Planning Phase** — The agent explores the codebase using read-only tools (read_file, search_files, list_directory, etc.) to understand the structure
+2. **Review Phase** — A detailed execution plan is generated and shown to you
+3. **Execution Phase** — Use `/run` to execute the approved plan with full tool access
+
+```bash
+# Example workflow
+↩︎ /plan Add input validation to all API endpoints
+
+🗺️ Planning Mode (read-only exploration)
+───────────────────────────────────────
+🧠 Analyzing...
+
+🔧 read_file_with_lines → src/routes/api.ts
+🔧 search_files → "router.post" in src/
+🔧 read_file → src/middleware/validate.ts
+
+📋 EXECUTION PLAN
+━━━━━━━━━━━━━━━━━
+Task: Add input validation to API endpoints
+
+Steps:
+1. Create validation schemas in src/schemas/api.ts
+2. Add Zod validation to POST /users endpoint (line 45-60)
+3. Add Zod validation to POST /orders endpoint (line 82-95)
+4. Update error handling middleware
+
+Files to modify:
+- src/routes/api.ts
+- src/middleware/error.ts
+
+Files to create:
+- src/schemas/api.ts
+
+Estimated tool calls: 5
+
+✓ Plan created!
+  Type /run to execute this plan
+
+↩︎ /run
+
+⚡ Executing Plan
+───────────────────────────────────────
+# Agent now executes the plan with full tool access
+```
 
 ### Safety Levels
 
@@ -166,6 +218,7 @@ The agent prompts for user confirmation before executing potentially dangerous o
 | **full** (default) | Prompts for all file modifications (write, edit, delete, move, execute) |
 | **delete-only** | Only prompts for delete and execute commands |
 | **off** | No prompts (use with extreme caution!) |
+
 
 Toggle with `/safe` command.
 

@@ -455,9 +455,15 @@ export async function generateProjectMap(dir: string, maxDepth: number = 4, maxF
 
 async function readFile({ path: filePath, start_line, end_line, show_line_numbers = false }: { path: string; start_line?: number; end_line?: number; show_line_numbers?: boolean }) {
     try {
+        // Validate path security - prevent traversal and sensitive file access
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
         if (start_line !== undefined || end_line !== undefined) {
             // Read specific lines - streaming, so no size check needed
-            const fileStream = createReadStream(filePath);
+            const fileStream = createReadStream(pathCheck.resolvedPath);
             const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
             const lines: string[] = [];
@@ -481,12 +487,12 @@ async function readFile({ path: filePath, start_line, end_line, show_line_number
         }
 
         // Check file size before reading entire file into memory
-        const sizeCheck = await checkFileSize(filePath);
+        const sizeCheck = await checkFileSize(pathCheck.resolvedPath);
         if (!sizeCheck.ok) {
             return `Error: ${sizeCheck.error}`;
         }
 
-        const content = await fs.readFile(filePath, 'utf-8');
+        const content = await fs.readFile(pathCheck.resolvedPath, 'utf-8');
         if (show_line_numbers) {
             const lines = content.split('\n');
             return lines.map((line, i) => `${i + 1} | ${line}`).join('\n');
@@ -504,7 +510,13 @@ async function readFile({ path: filePath, start_line, end_line, show_line_number
  */
 async function readFileWithLines({ path: filePath, start_line, end_line }: { path: string; start_line?: number; end_line?: number }) {
     try {
-        const fileStream = createReadStream(filePath);
+        // Validate path security - prevent traversal and sensitive file access
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const fileStream = createReadStream(pathCheck.resolvedPath);
         const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
         const lines: string[] = [];
@@ -675,8 +687,14 @@ async function moveFile({ source, destination }: { source: string; destination: 
 
 async function getFileInfo({ path: filePath }: { path: string }) {
     try {
-        const stat = await fs.stat(filePath);
-        const content = stat.isFile() ? await fs.readFile(filePath, 'utf-8') : null;
+        // Validate path security - prevent traversal and sensitive file access
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const stat = await fs.stat(pathCheck.resolvedPath);
+        const content = stat.isFile() ? await fs.readFile(pathCheck.resolvedPath, 'utf-8') : null;
         const lineCount = content ? content.split('\n').length : 0;
 
         return JSON.stringify({
@@ -1317,3 +1335,28 @@ export const availableTools: Record<string, Function> = {
     search_files: searchFiles,
     get_current_directory: getCurrentDirectory,
 };
+
+// ============================================================================
+// READ-ONLY TOOLS FOR PLANNING MODE
+// ============================================================================
+
+/**
+ * Tools that are safe to use during planning mode.
+ * These only read/explore the codebase without modifying anything.
+ */
+export const READ_ONLY_TOOL_NAMES = [
+    'read_file',
+    'read_file_with_lines',
+    'list_directory',
+    'find_files',
+    'search_files',
+    'get_file_info',
+    'get_current_directory',
+];
+
+/**
+ * Filtered tools array for planning mode - only read-only tools
+ */
+export const readOnlyTools = tools.filter(
+    (tool) => READ_ONLY_TOOL_NAMES.includes(tool.function.name)
+);

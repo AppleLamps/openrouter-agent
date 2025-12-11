@@ -6,7 +6,7 @@ import * as readline from 'readline';
 import ora, { Ora } from 'ora';
 import chalk from 'chalk';
 import { highlight } from 'cli-highlight';
-import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap } from './tools';
+import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap, readOnlyTools, READ_ONLY_TOOL_NAMES } from './tools';
 
 // Configuration
 const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
@@ -380,6 +380,10 @@ export class Agent {
     // Debug mode flag
     private _debug: boolean = false;
 
+    // Planning mode state
+    private pendingPlan: string | null = null;
+    private pendingPlanTask: string | null = null;
+
     constructor(config: AgentConfig = {}) {
         this.currentModel = config.model || process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free';
         this.webSearchEnabled = config.webSearchEnabled || false;
@@ -466,6 +470,35 @@ export class Agent {
      */
     get debug(): boolean {
         return this._debug;
+    }
+
+    // ============================================================================
+    // PLANNING MODE
+    // ============================================================================
+
+    /**
+     * Check if there's a pending plan waiting to be executed
+     */
+    get hasPendingPlan(): boolean {
+        return this.pendingPlan !== null;
+    }
+
+    /**
+     * Get the pending plan and task
+     */
+    getPendingPlan(): { plan: string; task: string } | null {
+        if (this.pendingPlan && this.pendingPlanTask) {
+            return { plan: this.pendingPlan, task: this.pendingPlanTask };
+        }
+        return null;
+    }
+
+    /**
+     * Clear the pending plan
+     */
+    clearPlan(): void {
+        this.pendingPlan = null;
+        this.pendingPlanTask = null;
     }
 
     // ============================================================================
@@ -1117,5 +1150,313 @@ System:
         }
 
         await this.saveHistory();
+    }
+
+    // ============================================================================
+    // PLANNING MODE - Read-only exploration + plan generation
+    // ============================================================================
+
+    /**
+     * Build the planning-specific system prompt
+     */
+    private buildPlanningSystemPrompt(task: string): string {
+        return `
+You are a planning assistant for a coding agent. Your job is to analyze the codebase and create a detailed execution plan.
+
+=== TASK TO PLAN ===
+${task}
+
+=== MODE ===
+You are in PLANNING MODE. You can ONLY use read-only tools to explore the codebase:
+- read_file, read_file_with_lines: Read file contents
+- list_directory: List files and folders
+- find_files: Find files by pattern
+- search_files: Search for text in files
+- get_file_info: Get file metadata
+
+You CANNOT modify anything. Use these tools to understand the codebase structure, find relevant files, and understand the existing code.
+
+=== PROJECT CONTEXT ===
+- Working Directory: ${process.cwd()}
+- Project Type: ${this.projectContext || 'Unknown'}
+
+=== PROJECT STRUCTURE ===
+${this.projectMap || '(Project map not available)'}
+
+=== YOUR WORKFLOW ===
+1. First, explore the codebase to understand:
+   - What files are relevant to the task
+   - How the existing code is structured
+   - What patterns/conventions are used
+   - What dependencies or imports might be needed
+
+2. Then, output a detailed EXECUTION PLAN in this exact format:
+
+📋 EXECUTION PLAN
+━━━━━━━━━━━━━━━━━
+Task: [Brief description]
+
+Steps:
+1. [First step - be specific about which file, what changes]
+2. [Second step]
+3. [Third step]
+...
+
+Files to modify:
+- path/to/file1.ts (what changes)
+- path/to/file2.ts (what changes)
+
+Files to create:
+- path/to/newfile.ts (purpose)
+
+Risks/considerations:
+- [Any potential issues to watch for]
+
+Estimated tool calls: [number]
+
+=== IMPORTANT ===
+- Be SPECIFIC: mention exact file paths, line numbers if known, function names
+- Think about DEPENDENCIES: what needs to happen first
+- Consider SAFETY: note any destructive operations
+- After exploring, ALWAYS output the execution plan
+`;
+    }
+
+    /**
+     * Create a plan for a task using read-only exploration of the codebase.
+     * The LLM explores relevant files and then outputs a structured plan.
+     */
+    async plan(task: string): Promise<void> {
+        console.log('');
+        console.log(chalk.cyan.bold('🗺️  Planning Mode') + chalk.dim(' (read-only exploration)'));
+        console.log(chalk.dim('─'.repeat(55)));
+
+        // Clear any previous plan
+        this.clearPlan();
+
+        // Build messages with planning-specific system prompt
+        const systemPrompt: ChatCompletionMessageParam = {
+            role: 'system',
+            content: this.buildPlanningSystemPrompt(task)
+        };
+
+        // Start fresh for planning (don't use conversation history)
+        const messages: any[] = [systemPrompt, { role: 'user', content: `Please analyze the codebase and create a plan for: ${task}` }];
+
+        const maxSteps = 10; // Allow exploration steps
+        let currentStep = 0;
+
+        this.status.startRequest();
+
+        while (currentStep < maxSteps) {
+            currentStep++;
+
+            try {
+                const stepInfo = currentStep > 1 ? `exploring step ${currentStep}` : 'analyzing';
+                this.status.setState('thinking', stepInfo);
+
+                const modelToUse = this.webSearchEnabled ? `${this.currentModel}:online` : this.currentModel;
+
+                const response = await this.callWithRetry(() =>
+                    this.openai.chat.completions.create({
+                        model: modelToUse,
+                        messages: messages,
+                        tools: readOnlyTools as any, // Only read-only tools!
+                        stream: true,
+                    })
+                );
+
+                let streamStarted = false;
+                let fullContent = '';
+                let toolCalls: any[] = [];
+                let hasToolCalls = false;
+
+                for await (const chunk of response) {
+                    const delta = chunk.choices[0]?.delta;
+
+                    if (delta?.content) {
+                        if (!streamStarted) {
+                            this.status.setState('streaming');
+                            this.status.printStreamStart();
+                            streamStarted = true;
+                        }
+                        process.stdout.write(delta.content);
+                        fullContent += delta.content;
+                        this.status.updateStreaming(delta.content.length);
+                    }
+
+                    if (delta?.tool_calls) {
+                        if (!hasToolCalls) {
+                            this.status.stopSpinner();
+                            hasToolCalls = true;
+                        }
+
+                        for (const tcDelta of delta.tool_calls) {
+                            if (tcDelta.index !== undefined) {
+                                if (toolCalls.length <= tcDelta.index) {
+                                    toolCalls.push({
+                                        id: '',
+                                        type: 'function',
+                                        function: { name: '', arguments: '' },
+                                    });
+                                }
+                                const current = toolCalls[tcDelta.index];
+                                if (tcDelta.id) current.id += tcDelta.id;
+                                if (tcDelta.function?.name) current.function.name += tcDelta.function.name;
+                                if (tcDelta.function?.arguments) current.function.arguments += tcDelta.function.arguments;
+                            }
+                        }
+                    }
+
+                    if ((chunk as any).usage) {
+                        const usage = (chunk as any).usage;
+                        this.totalTokens.input += usage.prompt_tokens || 0;
+                        this.totalTokens.output += usage.completion_tokens || 0;
+                    }
+                }
+
+                if (streamStarted && fullContent) {
+                    this.status.printStreamEnd();
+                }
+
+                const assistantMessage: any = {
+                    role: 'assistant',
+                    content: fullContent || null,
+                };
+
+                if (toolCalls.length > 0) {
+                    assistantMessage.tool_calls = toolCalls;
+                    messages.push(assistantMessage);
+
+                    // Execute read-only tools
+                    for (const toolCall of toolCalls) {
+                        const functionName = toolCall.function.name;
+
+                        // Double-check it's a read-only tool
+                        if (!READ_ONLY_TOOL_NAMES.includes(functionName)) {
+                            console.log(chalk.red(`\\n⚠️ Blocked non-read-only tool in planning mode: ${functionName}`));
+                            const toolMessage = {
+                                role: 'tool' as const,
+                                tool_call_id: toolCall.id,
+                                name: functionName,
+                                content: 'Error: This tool is not available in planning mode. Only read-only tools are allowed.',
+                            };
+                            messages.push(toolMessage);
+                            continue;
+                        }
+
+                        let functionArgs: Record<string, unknown> = {};
+                        try {
+                            functionArgs = JSON.parse(toolCall.function.arguments || '{}');
+                        } catch {
+                            const toolMessage = {
+                                role: 'tool' as const,
+                                tool_call_id: toolCall.id,
+                                name: functionName,
+                                content: 'Error: Invalid JSON arguments',
+                            };
+                            messages.push(toolMessage);
+                            continue;
+                        }
+
+                        console.log(formatToolCall(functionName, functionArgs));
+
+                        // Validate and execute
+                        const validation = validateToolArgs(functionName, functionArgs);
+                        let toolOutput: string;
+
+                        if (!validation.success) {
+                            toolOutput = validation.error;
+                        } else if (availableTools[functionName]) {
+                            this.status.setState('executing', functionName);
+                            try {
+                                toolOutput = await availableTools[functionName](validation.data);
+                            } catch (err: unknown) {
+                                const errMsg = err instanceof Error ? err.message : String(err);
+                                toolOutput = `Error: ${errMsg}`;
+                            }
+                            this.status.stopSpinner();
+                        } else {
+                            toolOutput = `Error: Tool ${functionName} not found`;
+                        }
+
+                        console.log(formatToolResult(toolOutput, true, 200)); // Shorter output in planning mode
+
+                        const toolMessage = {
+                            role: 'tool' as const,
+                            tool_call_id: toolCall.id,
+                            name: functionName,
+                            content: toolOutput,
+                        };
+                        messages.push(toolMessage);
+                    }
+                } else {
+                    // No tool calls - LLM has finished and should have output the plan
+                    messages.push(assistantMessage);
+
+                    // Check if the response contains a plan
+                    if (fullContent && (fullContent.includes('EXECUTION PLAN') || fullContent.includes('Steps:'))) {
+                        // Store the plan
+                        this.pendingPlan = fullContent;
+                        this.pendingPlanTask = task;
+
+                        console.log('');
+                        console.log(chalk.green.bold('✓ Plan created!'));
+                        console.log(chalk.dim(`  Type ${chalk.yellow('/run')} to execute this plan`));
+                        console.log(chalk.dim(`  Type ${chalk.yellow('/plan <new task>')} to create a different plan`));
+                        console.log(chalk.dim(`  Or continue chatting normally`));
+                    } else {
+                        console.log(chalk.yellow('\\n⚠️ No structured plan detected in response.'));
+                    }
+
+                    this.status.setState('complete');
+                    break;
+                }
+            } catch (error: any) {
+                this.status.setState('error', error.message || 'Unknown error');
+                break;
+            }
+        }
+
+        if (currentStep >= maxSteps) {
+            console.log(chalk.yellow(`\\n⚠️ Reached maximum exploration steps (${maxSteps}).`));
+        }
+    }
+
+    /**
+     * Execute the pending plan with full tool access
+     */
+    async executePlan(): Promise<void> {
+        if (!this.pendingPlan || !this.pendingPlanTask) {
+            console.log(chalk.yellow('No pending plan to execute. Use /plan <task> first.'));
+            return;
+        }
+
+        console.log('');
+        console.log(chalk.cyan.bold('⚡ Executing Plan'));
+        console.log(chalk.dim('─'.repeat(55)));
+        console.log(chalk.dim(`Task: ${this.pendingPlanTask}`));
+        console.log('');
+
+        // Construct a prompt that includes the plan
+        const executionPrompt = `
+Execute the following plan that was created after analyzing the codebase:
+
+=== ORIGINAL TASK ===
+${this.pendingPlanTask}
+
+=== APPROVED PLAN ===
+${this.pendingPlan}
+
+=== INSTRUCTIONS ===
+Execute each step in the plan. You now have access to ALL tools including write, edit, and execute.
+Follow the plan closely but adapt if you encounter any unexpected issues.
+`;
+
+        // Clear the plan after execution starts
+        this.clearPlan();
+
+        // Run with full tools
+        await this.run(executionPrompt);
     }
 }

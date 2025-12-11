@@ -153,3 +153,39 @@ describe('Agent Token Management', () => {
     // Note: More detailed token estimation tests would require
     // exposing the private methods or testing via integration tests
 });
+
+// ============================================================================
+// Planning Mode Tests
+// ============================================================================
+
+describe('Agent Planning Mode', () => {
+    let agent: Agent;
+
+    beforeEach(() => {
+        agent = new Agent({
+            apiKey: 'test-key',
+            model: 'test-model',
+        });
+    });
+
+    describe('hasPendingPlan', () => {
+        it('should return false when no plan exists', () => {
+            expect(agent.hasPendingPlan).toBe(false);
+        });
+    });
+
+    describe('getPendingPlan', () => {
+        it('should return null when no plan exists', () => {
+            expect(agent.getPendingPlan()).toBeNull();
+        });
+    });
+
+    describe('clearPlan', () => {
+        it('should clear any pending plan', () => {
+            // Clear should work even with no plan
+            agent.clearPlan();
+            expect(agent.hasPendingPlan).toBe(false);
+            expect(agent.getPendingPlan()).toBeNull();
+        });
+    });
+});
