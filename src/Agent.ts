@@ -266,6 +266,25 @@ function formatToolCall(name: string, args: any): string {
 }
 
 /**
+ * Colorize diff output - green for additions, red for deletions
+ */
+function colorizeDiff(text: string): string {
+    return text
+        .split('\n')
+        .map(line => {
+            if (line.startsWith('+') && !line.startsWith('+++')) {
+                return chalk.green(line);
+            } else if (line.startsWith('-') && !line.startsWith('---')) {
+                return chalk.red(line);
+            } else if (line.startsWith('@@')) {
+                return chalk.cyan(line);
+            }
+            return line;
+        })
+        .join('\n');
+}
+
+/**
  * Format tool result display
  */
 function formatToolResult(output: string, success: boolean = true, maxLength: number = 300): string {
@@ -273,10 +292,14 @@ function formatToolResult(output: string, success: boolean = true, maxLength: nu
         ? output.slice(0, maxLength) + '\n... (truncated)'
         : output;
 
+    // Apply diff colorization if the output looks like a diff
+    const isDiff = truncated.includes('\n+') || truncated.includes('\n-') || truncated.includes('@@');
+    const colorizedOutput = isDiff ? colorizeDiff(truncated) : truncated;
+
     const icon = success ? '📋' : '❌';
     const color = success ? chalk.dim : chalk.red;
 
-    return `\n${color('┌─')} ${icon} ${success ? chalk.dim('Result') : chalk.red('Error')} ${color('─'.repeat(43) + '┐')}\n${truncated}\n${color('└' + '─'.repeat(54) + '┘')}`
+    return `\n${color('┌─')} ${icon} ${success ? chalk.dim('Result') : chalk.red('Error')} ${color('─'.repeat(43) + '┐')}\n${colorizedOutput}\n${color('└' + '─'.repeat(54) + '┘')}`
 }
 
 interface TokenUsage {
@@ -327,6 +350,9 @@ export class Agent {
     // Project map caching
     private projectMapCacheTime: number = 0;
     private readonly PROJECT_MAP_CACHE_TTL = 300000; // 5 minutes
+
+    // Debug mode flag
+    private _debug: boolean = false;
 
     constructor(config: AgentConfig = {}) {
         this.currentModel = config.model || process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free';
@@ -392,6 +418,28 @@ export class Agent {
 
     setReadlineInterface(rl: readline.Interface): void {
         this.rl = rl;
+    }
+
+    /**
+     * Get the current project map structure
+     */
+    getProjectMap(): string {
+        return this.projectMap;
+    }
+
+    /**
+     * Toggle debug mode and return new state
+     */
+    toggleDebug(): boolean {
+        this._debug = !this._debug;
+        return this._debug;
+    }
+
+    /**
+     * Get current debug mode state
+     */
+    get debug(): boolean {
+        return this._debug;
     }
 
     // ============================================================================
@@ -772,6 +820,13 @@ System:
                 const stepInfo = this.status.getStep() > 1 ? `step ${this.status.getStep()}` : undefined;
                 this.status.setState('thinking', stepInfo);
 
+                // Debug mode: dump request payload
+                if (this._debug) {
+                    console.log(chalk.gray('\n🔎 Debug - Request payload:'));
+                    console.log(chalk.gray(JSON.stringify({ model: modelToUse, messages: messages.slice(-3) }, null, 2)));
+                    console.log(chalk.gray('... (showing last 3 messages)\n'));
+                }
+
                 const response = await this.callWithRetry(() =>
                     this.openai.chat.completions.create({
                         model: modelToUse,
@@ -926,6 +981,9 @@ System:
                             console.log('\n' + formatResponseWithHighlighting(fullContent));
                         }
                     }
+
+                    // Display token usage for this session
+                    console.log(chalk.dim(`\n📊 Tokens: ${this.totalTokens.input.toLocaleString()} in / ${this.totalTokens.output.toLocaleString()} out`));
 
                     // Show completion status
                     this.status.setState('complete');

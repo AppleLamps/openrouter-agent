@@ -1,12 +1,27 @@
 import 'dotenv/config';
 import * as readline from 'readline';
+import * as fs from 'fs';
+import * as path from 'path';
 import chalk from 'chalk';
 import { Agent } from './Agent';
 
-// Create readline interface
+// Available commands for tab-completion
+const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', 'exit'];
+
+// History file path
+const HISTORY_PATH = path.join(process.cwd(), '.ora_history');
+const MAX_HISTORY_LINES = 200;
+
+// Create readline interface with tab-completion
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
+    completer: (line: string): [string[], string] => {
+        const trimmed = line.trim();
+        const hits = COMMANDS.filter(c => c.startsWith(trimmed));
+        // Return [matches, line] – readline will display the list if >1
+        return [hits.length ? hits : COMMANDS, line];
+    },
 });
 
 // Create the Agent instance and pass the readline interface
@@ -44,10 +59,15 @@ async function handleCommand(input: string): Promise<boolean> {
             console.log(chalk.dim('   Estimated cost varies by model. Check OpenRouter pricing.'));
             return true;
 
+        case '/c':
         case '/clear':
             agent.clearHistory();
             agent.saveHistory();
             console.log(chalk.green('✓ Conversation history cleared.'));
+            return true;
+
+        case '/cls':
+            console.clear();
             return true;
 
         case '/safe':
@@ -66,6 +86,48 @@ async function handleCommand(input: string): Promise<boolean> {
             console.log(chalk.green('✓ Project structure refreshed.'));
             return true;
 
+        case '/config':
+            console.log('');
+            console.log(chalk.bold.cyan('Current Configuration:'));
+            console.log(`  ${chalk.cyan('Model:')}     ${chalk.white(agent.model)}`);
+            console.log(`  ${chalk.cyan('Web:')}       ${agent.webSearch ? chalk.green('ON') : chalk.yellow('OFF')}`);
+            const safetyColor = agent.safetyLevel === 'full' ? chalk.green : agent.safetyLevel === 'delete-only' ? chalk.yellow : chalk.red;
+            console.log(`  ${chalk.cyan('Safety:')}    ${safetyColor(agent.safetyLevel.toUpperCase())}`);
+            console.log(`  ${chalk.cyan('Project:')}   ${chalk.white(agent.getProjectContext() || 'Unknown')}`);
+            console.log(`  ${chalk.cyan('Directory:')} ${chalk.white(process.cwd())}`);
+            const tokenCount = agent.tokens;
+            console.log(`  ${chalk.cyan('Tokens:')}    ${chalk.white(`${tokenCount.input} in / ${tokenCount.output} out`)}`);
+            console.log('');
+            return true;
+
+        case '/cost':
+            const costTokens = agent.tokens;
+            // Approximate pricing (GPT-4o rates as example - actual varies by model)
+            const inputCost = (costTokens.input / 1000) * 0.005; // $5 per 1M input
+            const outputCost = (costTokens.output / 1000) * 0.015; // $15 per 1M output
+            const totalCost = inputCost + outputCost;
+            console.log(chalk.cyan(`💰 Token usage this session:`));
+            console.log(`   Input:  ${chalk.white(costTokens.input.toLocaleString())} tokens`);
+            console.log(`   Output: ${chalk.white(costTokens.output.toLocaleString())} tokens`);
+            console.log(`   ${chalk.dim('Estimated cost: ~$' + totalCost.toFixed(5))} ${chalk.dim('(varies by model)')}`);
+            return true;
+
+        case '/map':
+            const projectMap = agent.getProjectMap();
+            if (projectMap) {
+                console.log(chalk.bold.cyan('\nProject Structure:'));
+                console.log(projectMap);
+            } else {
+                console.log(chalk.yellow('No project map generated yet. Run /refresh to generate.'));
+            }
+            return true;
+
+        case '/debug':
+            const debugState = agent.toggleDebug();
+            console.log(`Debug mode: ${debugState ? chalk.green('ON') : chalk.yellow('OFF')}`);
+            return true;
+
+        case '/h':
         case '/help':
             console.log(`
 ${chalk.bold.cyan('Available Commands:')}
@@ -73,15 +135,24 @@ ${chalk.bold.cyan('Available Commands:')}
   ${chalk.yellow('/web')}           - Toggle web search (appends :online)
   ${chalk.yellow('/safe')}          - Cycle safety: full → delete-only → off
   ${chalk.yellow('/tokens')}        - Show token usage for this session
-  ${chalk.yellow('/clear')}         - Clear conversation history
+  ${chalk.yellow('/cost')}          - Show estimated cost for this session
+  ${chalk.yellow('/config')}        - Show current configuration
+  ${chalk.yellow('/clear')} ${chalk.dim('(/c)')}    - Clear conversation history
+  ${chalk.yellow('/cls')}           - Clear the terminal screen
   ${chalk.yellow('/refresh')}       - Refresh project structure map
-  ${chalk.yellow('/help')}          - Show this help message
+  ${chalk.yellow('/map')}           - View the current project structure
+  ${chalk.yellow('/debug')}         - Toggle debug mode (show API payloads)
+  ${chalk.yellow('/help')} ${chalk.dim('(/h)')}     - Show this help message
   ${chalk.yellow('exit')}           - Quit the agent
 
 ${chalk.bold.cyan('Safety Levels:')}
   ${chalk.green('full')}        - Prompts for all file modifications
   ${chalk.yellow('delete-only')} - Only prompts for delete and execute commands
   ${chalk.red('off')}         - No prompts (use with caution!)
+
+${chalk.bold.cyan('Tips:')}
+  ${chalk.dim('•')} Press ${chalk.cyan('Tab')} to autocomplete commands
+  ${chalk.dim('•')} Use ${chalk.cyan('↑/↓')} arrows to browse command history
             `);
             return true;
 
@@ -91,10 +162,41 @@ ${chalk.bold.cyan('Safety Levels:')}
 }
 
 // ============================================================================
+// REPL HISTORY HELPERS
+// ============================================================================
+
+function loadReplHistory(): void {
+    try {
+        if (fs.existsSync(HISTORY_PATH)) {
+            const historyData = fs.readFileSync(HISTORY_PATH, 'utf-8');
+            const lines = historyData.split('\n').filter(line => line.trim());
+            // readline.history is in reverse order (newest first)
+            (rl as any).history = lines.reverse().slice(0, MAX_HISTORY_LINES);
+        }
+    } catch (err) {
+        // Ignore history load errors
+    }
+}
+
+function saveReplHistory(): void {
+    try {
+        const history = (rl as any).history || [];
+        // Save in chronological order (oldest first)
+        const toSave = history.slice(0, MAX_HISTORY_LINES).reverse().join('\n');
+        fs.writeFileSync(HISTORY_PATH, toSave);
+    } catch (err) {
+        // Ignore history save errors
+    }
+}
+
+// ============================================================================
 // REPL LOOP
 // ============================================================================
 
 async function startREPL() {
+    // Load REPL command history from previous sessions
+    loadReplHistory();
+
     await agent.initialize();
 
     // Pretty startup banner
@@ -124,16 +226,15 @@ async function startREPL() {
     console.log(chalk.dim('│') + ` ${chalk.green('✓ Complete')}   ${chalk.dim('- Task finished successfully')}        ${chalk.dim('│')}`);
     console.log(chalk.dim('└─────────────────────────────────────────────────────────┘'));
     console.log('');
-    console.log(chalk.dim('Type') + chalk.yellow(' /help ') + chalk.dim('for commands,') + chalk.yellow(' exit ') + chalk.dim('to quit.'));
+    console.log(chalk.dim('Type') + chalk.yellow(' /help ') + chalk.dim('for commands,') + chalk.yellow(' exit ') + chalk.dim('to quit. Press') + chalk.cyan(' Tab ') + chalk.dim('for autocomplete.'));
     console.log('');
 
     const promptUser = () => {
-        rl.question(chalk.cyan('❯ '), async (input) => {
+        rl.question(chalk.cyan('↩︎ '), async (input) => {
             const trimmed = input.trim();
 
             if (trimmed.toLowerCase() === 'exit') {
-                await agent.saveHistory();
-                rl.close();
+                await gracefulShutdown();
                 return;
             }
 
@@ -150,4 +251,27 @@ async function startREPL() {
     promptUser();
 }
 
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+async function gracefulShutdown() {
+    console.log(chalk.cyan('\n👋 Saving and exiting...'));
+    await agent.saveHistory();
+    saveReplHistory();
+    rl.close();
+    process.exit(0);
+}
+
+// Handle Ctrl+C gracefully
+process.on('SIGINT', async () => {
+    await gracefulShutdown();
+});
+
+// Handle readline close (for clean exit)
+rl.on('close', () => {
+    saveReplHistory();
+});
+
 startREPL();
+

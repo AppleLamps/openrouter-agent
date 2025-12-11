@@ -7,6 +7,7 @@ node_modules/
 
 # Agent state
 .agent_history.json
+.ora_history
 *.bak
 
 # Build output

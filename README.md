@@ -11,10 +11,15 @@ A powerful, multi-tool AI coding assistant that runs in your terminal. Built wit
 - **🔄 Multi-step Reasoning** — Agent autonomously chains tools to complete tasks
 - **🌐 Web Search** — Toggle real-time web access with `/web`
 - **💾 Persistent History** — Conversations saved across sessions
+- **⌨️ Tab Completion** — Press Tab to autocomplete commands
+- **📜 REPL History** — Arrow up/down to recall previous prompts (persisted across sessions)
 - **🔁 Auto-retry** — Exponential backoff for API errors
 - **📁 Project Detection** — Auto-detects Node.js, Python, Rust, Go, and more
 - **💿 Automatic Backups** — Creates `.bak` files before edits
-- **📊 Diff Output** — Shows changes after file edits
+- **📊 Colour-coded Diffs** — Green for additions, red for deletions
+- **💰 Token Usage Display** — Shows token count after each request
+- **🐛 Debug Mode** — Toggle with `/debug` to see API payloads
+- **⚡ Graceful Shutdown** — Ctrl+C saves history and exits cleanly
 
 ---
 
@@ -95,47 +100,70 @@ ora
 ```
 
 ```
---- OpenRouter CLI Agent (Enhanced) ---
-Model: mistralai/devstral-2512:free
-Project: Node.js/JavaScript, TypeScript
-Directory: C:\Users\lucas\my-project
-Type /help for commands. Type "exit" to quit.
+╔══════════════════════════════════════════════════════════╗
+║         🤖 OpenRouter CLI Agent v1.0                    ║
+╚══════════════════════════════════════════════════════════╝
 
->
+┌─ Configuration ─────────────────────────────────────────┐
+│ Model:     mistralai/devstral-2512:free                │
+│ Safety:    FULL                                         │
+│ Project:   Node.js/JavaScript, TypeScript              │
+│ Directory: C:\Users\lucas\my-project                   │
+└─────────────────────────────────────────────────────────┘
+
+Type /help for commands, exit to quit. Press Tab for autocomplete.
+
+↩︎ 
 ```
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `/model [name]` | Show or change model |
-| `/web` | Toggle web search |
-| `/tokens` | Show token usage |
-| `/clear` | Clear conversation history |
-| `/help` | Show help |
-| `exit` | Quit |
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `/model [name]` | | Show or change model |
+| `/web` | | Toggle web search (:online suffix) |
+| `/safe` | | Cycle safety level: full → delete-only → off |
+| `/tokens` | | Show token usage |
+| `/cost` | | Show estimated cost for session |
+| `/config` | | Show current configuration |
+| `/clear` | `/c` | Clear conversation history |
+| `/cls` | | Clear the terminal screen |
+| `/refresh` | | Refresh project structure map |
+| `/map` | | View the current project structure |
+| `/debug` | | Toggle debug mode (show API payloads) |
+| `/help` | `/h` | Show help |
+| `exit` | | Quit |
+
+### Tips
+
+- Press **Tab** to autocomplete commands
+- Use **↑/↓** arrows to browse command history
+- Press **Ctrl+C** for graceful shutdown (saves all history)
 
 ### Example Session
 
 ```
-> Create a Python script that fetches weather data and save it to weather.py
+↩︎ Create a Python script that fetches weather data and save it to weather.py
 
-[Tool Call] write_file({"path":"weather.py","content":"import requests..."})
-[Tool Result] Successfully wrote to weather.py
+🔧 write_file
+  path: "weather.py"
+  size: 342 characters
 
-[Tool Call] execute_command({"command":"python weather.py"})
-[Command Output]
-Current temperature: 72°F
-[Exit Code: 0]
+📋 Result
+Successfully wrote to weather.py
 
-Done! Created weather.py and tested it successfully.
+📊 Tokens: 1,234 in / 567 out
+✓ Complete (2s | 1 tool used)
 
-> Edit weather.py to add error handling
+↩︎ Edit weather.py to add error handling
 
-[Tool Call] edit_file({"path":"weather.py","old_text":"response = requests.get(url)","new_text":"try:\n    response = requests.get(url)\nexcept Exception as e:\n    print(f'Error: {e}')"})
-[Tool Result] Edited weather.py: replaced 1 occurrence(s)
+🔧 edit_file
+  path: "weather.py"  
+  find: "response = requests.get(url)..."
 
-Diff:
+📋 Result
+Edited weather.py: replaced 1 occurrence(s)
+
 -response = requests.get(url)
 +try:
 +    response = requests.get(url)
