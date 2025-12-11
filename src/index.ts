@@ -99,24 +99,36 @@ async function startREPL() {
 
     // Pretty startup banner
     console.log('');
-    console.log(chalk.cyan.bold('╔══════════════════════════════════════════════════════╗'));
-    console.log(chalk.cyan.bold('║') + chalk.white.bold('       🤖 OpenRouter CLI Agent (Enhanced)            ') + chalk.cyan.bold('║'));
-    console.log(chalk.cyan.bold('╚══════════════════════════════════════════════════════╝'));
+    console.log(chalk.cyan.bold('╔══════════════════════════════════════════════════════════╗'));
+    console.log(chalk.cyan.bold('║') + chalk.white.bold('         🤖 OpenRouter CLI Agent v1.0                    ') + chalk.cyan.bold('║'));
+    console.log(chalk.cyan.bold('╚══════════════════════════════════════════════════════════╝'));
     console.log('');
-    console.log(chalk.dim('┌─────────────────────────────────────────────────────┐'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Model:')}     ${chalk.white(agent.model.padEnd(40))}` + chalk.dim('│'));
+
+    // Configuration info
+    console.log(chalk.dim('┌─ Configuration ─────────────────────────────────────────┐'));
+    console.log(chalk.dim('│') + ` ${chalk.cyan('Model:')}     ${chalk.white(agent.model.slice(0, 44).padEnd(44))}` + chalk.dim('│'));
     const safetyColors = { 'full': chalk.green, 'delete-only': chalk.yellow, 'off': chalk.red };
-    const safetyLabel = safetyColors[agent.safetyLevel](agent.safetyLevel.toUpperCase().padEnd(40));
+    const safetyLabel = safetyColors[agent.safetyLevel](agent.safetyLevel.toUpperCase().padEnd(44));
     console.log(chalk.dim('│') + ` ${chalk.cyan('Safety:')}    ${safetyLabel}` + chalk.dim('│'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Project:')}   ${chalk.white((agent.getProjectContext() || 'Unknown').slice(0, 40).padEnd(40))}` + chalk.dim('│'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Directory:')} ${chalk.white(process.cwd().slice(-40).padEnd(40))}` + chalk.dim('│'));
-    console.log(chalk.dim('└─────────────────────────────────────────────────────┘'));
+    console.log(chalk.dim('│') + ` ${chalk.cyan('Project:')}   ${chalk.white((agent.getProjectContext() || 'Unknown').slice(0, 44).padEnd(44))}` + chalk.dim('│'));
+    console.log(chalk.dim('│') + ` ${chalk.cyan('Directory:')} ${chalk.white(process.cwd().slice(-44).padEnd(44))}` + chalk.dim('│'));
+    console.log(chalk.dim('└─────────────────────────────────────────────────────────┘'));
     console.log('');
-    console.log(chalk.dim('Type') + chalk.yellow(' /help ') + chalk.dim('for commands.') + chalk.dim(' Type') + chalk.yellow(' exit ') + chalk.dim('to quit.'));
+
+    // Status legend - helps users understand what each indicator means
+    console.log(chalk.dim('┌─ Status Indicators ─────────────────────────────────────┐'));
+    console.log(chalk.dim('│') + ` ${chalk.cyan('🧠 Thinking')}   ${chalk.dim('- Processing your request')}          ${chalk.dim('│')}`);
+    console.log(chalk.dim('│') + ` ${chalk.white('│ ...')}        ${chalk.dim('- Streaming response text')}          ${chalk.dim('│')}`);
+    console.log(chalk.dim('│') + ` ${chalk.yellow('🔧 Tool')}       ${chalk.dim('- Calling a tool/function')}          ${chalk.dim('│')}`);
+    console.log(chalk.dim('│') + ` ${chalk.magenta('⚡ Executing')} ${chalk.dim('- Running tool operation')}           ${chalk.dim('│')}`);
+    console.log(chalk.dim('│') + ` ${chalk.green('✓ Complete')}   ${chalk.dim('- Task finished successfully')}        ${chalk.dim('│')}`);
+    console.log(chalk.dim('└─────────────────────────────────────────────────────────┘'));
+    console.log('');
+    console.log(chalk.dim('Type') + chalk.yellow(' /help ') + chalk.dim('for commands,') + chalk.yellow(' exit ') + chalk.dim('to quit.'));
     console.log('');
 
     const promptUser = () => {
-        rl.question('> ', async (input) => {
+        rl.question(chalk.cyan('❯ '), async (input) => {
             const trimmed = input.trim();
 
             if (trimmed.toLowerCase() === 'exit') {

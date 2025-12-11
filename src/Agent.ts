@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import * as readline from 'readline';
 import ora, { Ora } from 'ora';
+import chalk from 'chalk';
 import { highlight } from 'cli-highlight';
 import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap } from './tools';
 
@@ -11,6 +12,182 @@ const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
 const MAX_HISTORY_MESSAGES = 50;
 const MAX_CONTEXT_TOKENS = 100000; // Safe limit for context window
 const CHARS_PER_TOKEN = 4; // Rough approximation: 4 characters = 1 token
+
+// ============================================================================
+// STATUS & UI HELPERS
+// ============================================================================
+
+/**
+ * Agent states for visual feedback
+ */
+type AgentState = 'idle' | 'thinking' | 'streaming' | 'tool_calling' | 'executing' | 'complete' | 'error';
+
+/**
+ * Status display manager for rich visual feedback
+ */
+class StatusDisplay {
+    private spinner: Ora | null = null;
+    private startTime: number = 0;
+    private stepCount: number = 0;
+    private totalToolCalls: number = 0;
+    private streamingChars: number = 0;
+
+    /**
+     * Format elapsed time in human readable format
+     */
+    private formatElapsed(ms: number): string {
+        if (ms < 1000) return `${ms}ms`;
+        const seconds = Math.floor(ms / 1000);
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = seconds % 60;
+        return `${minutes}m ${remainingSeconds}s`;
+    }
+
+    /**
+     * Get current elapsed time
+     */
+    getElapsed(): string {
+        if (this.startTime === 0) return '0s';
+        return this.formatElapsed(Date.now() - this.startTime);
+    }
+
+    /**
+     * Start tracking a new request
+     */
+    startRequest(): void {
+        this.startTime = Date.now();
+        this.stepCount = 0;
+        this.totalToolCalls = 0;
+        this.streamingChars = 0;
+    }
+
+    /**
+     * Increment step counter
+     */
+    incrementStep(): void {
+        this.stepCount++;
+    }
+
+    /**
+     * Get current step number
+     */
+    getStep(): number {
+        return this.stepCount;
+    }
+
+    /**
+     * Set the current agent state with visual feedback
+     */
+    setState(state: AgentState, context?: string): void {
+        this.stopSpinner();
+
+        switch (state) {
+            case 'thinking':
+                this.spinner = ora({
+                    text: chalk.cyan(`🧠 Thinking... ${context ? `(${context})` : ''}`),
+                    spinner: 'dots12',
+                    color: 'cyan'
+                }).start();
+                break;
+
+            case 'streaming':
+                // Don't use spinner for streaming - we'll update inline
+                this.streamingChars = 0;
+                break;
+
+            case 'tool_calling':
+                this.spinner = ora({
+                    text: chalk.yellow(`🔧 Preparing tool call... ${context ? `(${context})` : ''}`),
+                    spinner: 'arc',
+                    color: 'yellow'
+                }).start();
+                break;
+
+            case 'executing':
+                this.totalToolCalls++;
+                this.spinner = ora({
+                    text: chalk.magenta(`⚡ Executing: ${context || 'tool'}...`),
+                    spinner: 'bouncingBar',
+                    color: 'magenta'
+                }).start();
+                break;
+
+            case 'complete':
+                const elapsed = this.getElapsed();
+                const toolInfo = this.totalToolCalls > 0 ? ` | ${this.totalToolCalls} tool${this.totalToolCalls > 1 ? 's' : ''} used` : '';
+                const stepsInfo = this.stepCount > 1 ? ` | ${this.stepCount} steps` : '';
+                console.log(chalk.green(`\n✓ Complete`) + chalk.dim(` (${elapsed}${stepsInfo}${toolInfo})`));
+                break;
+
+            case 'error':
+                console.log(chalk.red(`\n✗ Error: ${context || 'Unknown error'}`));
+                break;
+        }
+    }
+
+    /**
+     * Update streaming status - tracks character count
+     */
+    updateStreaming(chars: number): void {
+        this.streamingChars += chars;
+    }
+
+    /**
+     * Print streaming indicator at the start
+     */
+    printStreamStart(): void {
+        process.stdout.write(chalk.dim('│ '));
+    }
+
+    /**
+     * Print streaming complete indicator
+     */
+    printStreamEnd(): void {
+        console.log(chalk.dim(` │ `) + chalk.dim.italic(`${this.streamingChars} chars`));
+    }
+
+    /**
+     * Stop any running spinner
+     */
+    stopSpinner(): void {
+        if (this.spinner) {
+            this.spinner.stop();
+            this.spinner = null;
+        }
+    }
+
+    /**
+     * Display a step header
+     */
+    showStepHeader(): void {
+        if (this.stepCount > 1) {
+            console.log(chalk.dim(`\n─── Step ${this.stepCount} ───────────────────────────────────────────`));
+        }
+    }
+
+    /**
+     * Show a waiting for user input indicator
+     */
+    showWaitingForConfirmation(): void {
+        this.stopSpinner();
+        console.log(chalk.yellow('\n⏳ Waiting for user confirmation...'));
+    }
+
+    /**
+     * Show user denied message
+     */
+    showDenied(): void {
+        console.log(chalk.red('✗ Operation denied by user'));
+    }
+
+    /**
+     * Show user approved message
+     */
+    showApproved(): void {
+        console.log(chalk.green('✓ Approved'));
+    }
+}
 
 // ============================================================================
 // OUTPUT FORMATTING HELPERS
@@ -27,7 +204,7 @@ function formatResponseWithHighlighting(text: string): string {
         try {
             const language = lang || 'plaintext';
             const highlighted = highlight(code.trim(), { language, ignoreIllegals: true });
-            return `\n┌─ ${language} ${'─'.repeat(Math.max(0, 50 - language.length))}┐\n${highlighted}\n└${'─'.repeat(54)}┘\n`;
+            return `\n${chalk.dim('┌─')} ${chalk.cyan(language)} ${chalk.dim('─'.repeat(Math.max(0, 50 - language.length)) + '┐')}\n${highlighted}\n${chalk.dim('└' + '─'.repeat(54) + '┘')}\n`;
         } catch {
             // If highlighting fails, return original
             return match;
@@ -44,22 +221,37 @@ function formatToolCall(name: string, args: any): string {
     // Create human-readable summaries for common tools
     switch (name) {
         case 'write_file':
-            summary = `  path: "${args.path}"\n  content: ${args.content?.length || 0} characters`;
+            summary = `  ${chalk.dim('path:')} ${chalk.white('"' + args.path + '"')}\n  ${chalk.dim('size:')} ${chalk.yellow((args.content?.length || 0) + ' characters')}`;
             break;
         case 'edit_file':
             const oldPreview = (args.old_text || '').slice(0, 40).replace(/\n/g, '\\n');
-            summary = `  path: "${args.path}"\n  replacing: "${oldPreview}${args.old_text?.length > 40 ? '...' : ''}"`;
+            summary = `  ${chalk.dim('path:')} ${chalk.white('"' + args.path + '"')}\n  ${chalk.dim('find:')} ${chalk.red('"' + oldPreview + (args.old_text?.length > 40 ? '...' : '') + '"')}`;
             break;
         case 'edit_file_by_lines':
-            summary = `  path: "${args.path}"\n  lines: ${args.start_line}-${args.end_line}\n  new_content: ${args.new_content?.length || 0} chars`;
+            summary = `  ${chalk.dim('path:')} ${chalk.white('"' + args.path + '"')}\n  ${chalk.dim('lines:')} ${chalk.cyan(args.start_line + '-' + args.end_line)}\n  ${chalk.dim('size:')} ${chalk.yellow((args.new_content?.length || 0) + ' chars')}`;
             break;
         case 'execute_command':
             const cmd = args.command?.length > 60 ? args.command.slice(0, 57) + '...' : args.command;
-            summary = `  command: "${cmd}"${args.cwd ? `\n  cwd: "${args.cwd}"` : ''}`;
+            summary = `  ${chalk.dim('$')} ${chalk.green(cmd)}${args.cwd ? `\n  ${chalk.dim('cwd:')} ${chalk.white(args.cwd)}` : ''}`;
             break;
         case 'read_file':
         case 'read_file_with_lines':
-            summary = `  path: "${args.path}"${args.start_line ? `\n  lines: ${args.start_line}-${args.end_line || 'end'}` : ''}`;
+            summary = `  ${chalk.dim('path:')} ${chalk.white('"' + args.path + '"')}${args.start_line ? `\n  ${chalk.dim('lines:')} ${chalk.cyan(args.start_line + '-' + (args.end_line || 'end'))}` : ''}`;
+            break;
+        case 'list_directory':
+            summary = `  ${chalk.dim('dir:')} ${chalk.white('"' + args.directory + '"')}${args.recursive ? chalk.dim(' (recursive)') : ''}`;
+            break;
+        case 'search_files':
+            summary = `  ${chalk.dim('pattern:')} ${chalk.magenta('"' + args.pattern + '"')}\n  ${chalk.dim('dir:')} ${chalk.white('"' + args.directory + '"')}`;
+            break;
+        case 'find_files':
+            summary = `  ${chalk.dim('pattern:')} ${chalk.magenta('"' + args.pattern + '"')}\n  ${chalk.dim('dir:')} ${chalk.white('"' + args.directory + '"')}`;
+            break;
+        case 'delete_file':
+            summary = `  ${chalk.dim('path:')} ${chalk.red('"' + args.path + '"')}${args.recursive ? chalk.red(' (RECURSIVE!)') : ''}`;
+            break;
+        case 'move_file':
+            summary = `  ${chalk.dim('from:')} ${chalk.white('"' + args.source + '"')}\n  ${chalk.dim('  to:')} ${chalk.green('"' + args.destination + '"')}`;
             break;
         default:
             // For other tools, show truncated JSON
@@ -70,17 +262,21 @@ function formatToolCall(name: string, args: any): string {
                 : lines.map(l => l.length > 60 ? l.slice(0, 57) + '...' : l).join('\n');
     }
 
-    return `\n┌─ 🔧 Tool: ${name} ${'─'.repeat(Math.max(0, 45 - name.length))}┐\n${summary}\n└${'─'.repeat(54)}┘`;
+    return `\n${chalk.dim('┌─')} ${chalk.yellow('🔧 ' + name)} ${chalk.dim('─'.repeat(Math.max(0, 45 - name.length)) + '┐')}\n${summary}\n${chalk.dim('└' + '─'.repeat(54) + '┘')}`;
 }
 
 /**
  * Format tool result display
  */
-function formatToolResult(output: string, maxLength: number = 300): string {
+function formatToolResult(output: string, success: boolean = true, maxLength: number = 300): string {
     const truncated = output.length > maxLength
         ? output.slice(0, maxLength) + '\n... (truncated)'
         : output;
-    return `\n┌─ 📋 Result ${'─'.repeat(43)}┐\n${truncated}\n└${'─'.repeat(54)}┘`;
+
+    const icon = success ? '📋' : '❌';
+    const color = success ? chalk.dim : chalk.red;
+
+    return `\n${color('┌─')} ${icon} ${success ? chalk.dim('Result') : chalk.red('Error')} ${color('─'.repeat(43) + '┐')}\n${truncated}\n${color('└' + '─'.repeat(54) + '┘')}`
 }
 
 interface TokenUsage {
@@ -126,6 +322,7 @@ export class Agent {
     private projectMap: string = '';
     private _safetyLevel: 'off' | 'delete-only' | 'full';
     private rl: readline.Interface | null = null;
+    private status: StatusDisplay = new StatusDisplay();
 
     constructor(config: AgentConfig = {}) {
         this.currentModel = config.model || process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free';
@@ -535,24 +732,23 @@ System:
         // Build messages with system prompt and apply token limits
         const messages: any[] = this.prepareMessagesForAPI();
 
-        let step = 0;
         const maxSteps = 15;
-        let spinner: Ora | null = null;
 
+        // Initialize status tracking for this request
+        this.status.startRequest();
         console.log('');
 
-        while (step < maxSteps) {
-            step++;
+        while (this.status.getStep() < maxSteps) {
+            this.status.incrementStep();
+            this.status.showStepHeader();
+
             try {
                 // Build model name with :online suffix if web search enabled
                 const modelToUse = this.webSearchEnabled ? `${this.currentModel}:online` : this.currentModel;
 
-                // Start thinking spinner
-                spinner = ora({
-                    text: 'Thinking...',
-                    spinner: 'dots',
-                    color: 'cyan'
-                }).start();
+                // Show thinking state
+                const stepInfo = this.status.getStep() > 1 ? `step ${this.status.getStep()}` : undefined;
+                this.status.setState('thinking', stepInfo);
 
                 const response = await this.callWithRetry(() =>
                     this.openai.chat.completions.create({
@@ -563,27 +759,34 @@ System:
                     })
                 );
 
-                // Stop spinner when we start receiving response
-                let spinnerStopped = false;
-
+                let streamStarted = false;
                 let fullContent = '';
                 let toolCalls: any[] = [];
+                let hasToolCalls = false;
 
                 for await (const chunk of response) {
-                    // Stop spinner on first content
-                    if (!spinnerStopped && spinner) {
-                        spinner.stop();
-                        spinnerStopped = true;
-                    }
-
                     const delta = chunk.choices[0]?.delta;
 
                     if (delta?.content) {
+                        // First content received - transition to streaming state
+                        if (!streamStarted) {
+                            this.status.setState('streaming');
+                            this.status.printStreamStart();
+                            streamStarted = true;
+                        }
+
                         process.stdout.write(delta.content);
                         fullContent += delta.content;
+                        this.status.updateStreaming(delta.content.length);
                     }
 
                     if (delta?.tool_calls) {
+                        // Stop any spinners, we're processing tool calls
+                        if (!hasToolCalls) {
+                            this.status.stopSpinner();
+                            hasToolCalls = true;
+                        }
+
                         for (const tcDelta of delta.tool_calls) {
                             if (tcDelta.index !== undefined) {
                                 if (toolCalls.length <= tcDelta.index) {
@@ -602,13 +805,16 @@ System:
                     }
 
                     // Track usage if available
-                    // Note: OpenRouter sends usage in the final chunk only when streaming,
-                    // so we accumulate but typically only receive one usage object per response
                     if ((chunk as any).usage) {
                         const usage = (chunk as any).usage;
                         this.totalTokens.input += usage.prompt_tokens || 0;
                         this.totalTokens.output += usage.completion_tokens || 0;
                     }
+                }
+
+                // If we were streaming, show the end indicator
+                if (streamStarted && fullContent) {
+                    this.status.printStreamEnd();
                 }
 
                 const assistantMessage: any = {
@@ -633,11 +839,13 @@ System:
                         console.log(formatToolCall(functionName, functionArgs));
 
                         let toolOutput: string;
+                        let toolSuccess = true;
 
                         // Validate arguments using Zod schemas
                         const validation = validateToolArgs(functionName, functionArgs);
                         if (!validation.success) {
                             toolOutput = validation.error;
+                            toolSuccess = false;
                         } else if (availableTools[functionName]) {
                             // Determine if we need confirmation based on safety level
                             let needsConfirmation = false;
@@ -647,38 +855,33 @@ System:
                             } else if (this._safetyLevel === 'delete-only' && CRITICAL_TOOLS.includes(functionName)) {
                                 needsConfirmation = true;
                             }
-                            // 'off' = no confirmation needed
 
                             if (needsConfirmation) {
+                                this.status.showWaitingForConfirmation();
                                 const confirmed = await this.confirmDangerousAction(functionName, validation.data);
                                 if (!confirmed) {
+                                    this.status.showDenied();
                                     toolOutput = 'User denied this operation. Please ask for user consent before retrying, or try a different approach.';
+                                    toolSuccess = false;
                                 } else {
-                                    // Show execution spinner
-                                    const execSpinner = ora({
-                                        text: `Executing ${functionName}...`,
-                                        spinner: 'dots',
-                                        color: 'yellow'
-                                    }).start();
+                                    this.status.showApproved();
+                                    this.status.setState('executing', functionName);
                                     toolOutput = await availableTools[functionName](validation.data);
-                                    execSpinner.stop();
+                                    this.status.stopSpinner();
                                 }
                             } else {
-                                // Show execution spinner for auto-approved tools
-                                const execSpinner = ora({
-                                    text: `Executing ${functionName}...`,
-                                    spinner: 'dots',
-                                    color: 'green'
-                                }).start();
+                                // Auto-approved tool execution
+                                this.status.setState('executing', functionName);
                                 toolOutput = await availableTools[functionName](validation.data);
-                                execSpinner.stop();
+                                this.status.stopSpinner();
                             }
                         } else {
                             toolOutput = `Error: Tool ${functionName} not found.`;
+                            toolSuccess = false;
                         }
 
-                        // Display formatted result
-                        console.log(formatToolResult(toolOutput));
+                        // Display formatted result with success/error indication
+                        console.log(formatToolResult(toolOutput, toolSuccess));
 
                         const toolMessage = {
                             role: 'tool',
@@ -701,14 +904,20 @@ System:
                             console.log('\n' + formatResponseWithHighlighting(fullContent));
                         }
                     }
-                    console.log('');
+
+                    // Show completion status
+                    this.status.setState('complete');
                     break;
                 }
             } catch (error: any) {
-                if (spinner) spinner.stop();
-                console.error('\n❌ Error during API call:', error.message || error);
+                this.status.setState('error', error.message || 'Unknown error');
                 break;
             }
+        }
+
+        // Check if we hit max steps
+        if (this.status.getStep() >= maxSteps) {
+            console.log(chalk.yellow(`\n⚠️ Reached maximum steps (${maxSteps}). Task may be incomplete.`));
         }
 
         await this.saveHistory();
