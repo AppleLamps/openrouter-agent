@@ -5,6 +5,27 @@ import * as path from 'path';
 import chalk from 'chalk';
 import { Agent } from './Agent';
 
+// ============================================================================
+// ENVIRONMENT VALIDATION
+// ============================================================================
+
+function validateEnvironment(): void {
+    if (!process.env.OPENROUTER_API_KEY) {
+        console.error(chalk.red.bold('\n❌ Error: OPENROUTER_API_KEY environment variable is not set.\n'));
+        console.error(chalk.yellow('To fix this, either:\n'));
+        console.error(chalk.white('  1. Create a .env file in the project root with:'));
+        console.error(chalk.cyan('     OPENROUTER_API_KEY=your_api_key_here\n'));
+        console.error(chalk.white('  2. Or set it in your terminal:'));
+        console.error(chalk.cyan('     export OPENROUTER_API_KEY=your_api_key_here  (Linux/Mac)'));
+        console.error(chalk.cyan('     $env:OPENROUTER_API_KEY="your_api_key_here"  (PowerShell)\n'));
+        console.error(chalk.dim('Get your API key from: https://openrouter.ai/keys\n'));
+        process.exit(1);
+    }
+}
+
+// Validate environment before proceeding
+validateEnvironment();
+
 // Available commands for tab-completion
 const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', 'exit'];
 
@@ -174,7 +195,7 @@ function loadReplHistory(): void {
             (rl as any).history = lines.reverse().slice(0, MAX_HISTORY_LINES);
         }
     } catch (err) {
-        // Ignore history load errors
+        // History load errors are non-critical - start fresh
     }
 }
 
@@ -185,7 +206,7 @@ function saveReplHistory(): void {
         const toSave = history.slice(0, MAX_HISTORY_LINES).reverse().join('\n');
         fs.writeFileSync(HISTORY_PATH, toSave);
     } catch (err) {
-        // Ignore history save errors
+        // History save errors are non-critical - user can continue
     }
 }
 

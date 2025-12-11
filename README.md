@@ -22,8 +22,9 @@ A powerful, multi-tool AI coding assistant that runs in your terminal. Built wit
 - **🎨 Syntax Highlighting** — Code blocks in responses are syntax highlighted
 - **💰 Token Usage Display** — Shows token count after each request
 - **📏 Context Management** — Automatic token estimation and history trimming
-- **🐛 Debug Mode** — Toggle with `/debug` to see API payloads
+- **🐛 Debug Mode** — Toggle with `/debug` to see API payloads and hidden errors
 - **⚡ Graceful Shutdown** — Ctrl+C saves history and exits cleanly
+- **🧪 Unit Tests** — 55+ tests covering security validators and core logic (Vitest)
 
 ---
 
@@ -79,6 +80,14 @@ openrouter-agent    # Full command
 ```bash
 npm install
 npm start
+```
+
+### Running Tests
+
+```bash
+npm test              # Run all tests
+npm run test:watch    # Watch mode
+npm run test:coverage # Coverage report
 ```
 
 ---
@@ -224,18 +233,21 @@ Diff:
 ```
 openrouter-agent/
 ├── bin/
-│   └── cli.js          # CLI entry point (for npm link)
+│   └── cli.js            # CLI entry point (for npm link)
 ├── src/
-│   ├── index.ts        # REPL loop and command handlers
-│   ├── Agent.ts        # Core agent class (API calls, tool dispatch, safety)
-│   └── tools.ts        # Tool implementations and schemas (Zod validation)
-├── dist/               # Compiled JavaScript (generated)
-├── .env                # Your API key (gitignored)
-├── .env.example        # Example config
-├── .agent_history.json # Conversation history (gitignored)
-├── .ora_history        # REPL command history (gitignored)
+│   ├── index.ts          # REPL loop and command handlers
+│   ├── Agent.ts          # Core agent class (API calls, tool dispatch, safety)
+│   ├── Agent.test.ts     # Agent unit tests
+│   ├── tools.ts          # Tool implementations and schemas (Zod validation)
+│   └── tools.test.ts     # Tool validation unit tests
+├── dist/                 # Compiled JavaScript (generated)
+├── .env                  # Your API key (gitignored)
+├── .env.example          # Example config
+├── .agent_history.json   # Conversation history (gitignored)
+├── .ora_history          # REPL command history (gitignored)
 ├── package.json
 ├── tsconfig.json
+├── vitest.config.ts      # Test configuration
 └── README.md
 ```
 
@@ -254,6 +266,8 @@ Key features:
 - **Zod validation** — All tool arguments are validated before execution
 - **Automatic context management** — History is trimmed to stay under token limits
 - **Project map caching** — 5-minute TTL to avoid regenerating on every request
+- **Defensive error handling** — Tool execution wrapped in try/catch to prevent crashes
+- **Debug mode logging** — Hidden errors are revealed when debug mode is enabled
 
 ---
 

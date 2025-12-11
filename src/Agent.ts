@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import fs from 'fs/promises';
 import path from 'path';
 import * as readline from 'readline';
@@ -11,7 +12,7 @@ import { tools, availableTools, detectProjectType, validateToolArgs, generatePro
 const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
 const MAX_HISTORY_MESSAGES = 50;
 const MAX_CONTEXT_TOKENS = 100000; // Safe limit for context window
-const CHARS_PER_TOKEN = 4; // Rough approximation: 4 characters = 1 token
+const CHARS_PER_TOKEN = 3.5; // Conservative estimate: ~3.5 chars per token (code has more syntax overhead)
 
 // ============================================================================
 // STATUS & UI HELPERS
@@ -307,6 +308,31 @@ interface TokenUsage {
     output: number;
 }
 
+// ============================================================================
+// MESSAGE TYPE DEFINITIONS
+// ============================================================================
+
+/**
+ * Represents a tool/function call requested by the assistant.
+ */
+interface ToolCall {
+    id: string;
+    type: 'function';
+    function: {
+        name: string;
+        arguments: string;
+    };
+}
+
+/**
+ * Conversation message types for the OpenRouter API.
+ */
+type ConversationMessage =
+    | { role: 'system'; content: string }
+    | { role: 'user'; content: string }
+    | { role: 'assistant'; content: string | null; tool_calls?: ToolCall[] }
+    | { role: 'tool'; tool_call_id: string; name: string; content: string };
+
 interface AgentConfig {
     model?: string;
     webSearchEnabled?: boolean;
@@ -337,7 +363,7 @@ const DANGEROUS_TOOLS = [
 
 export class Agent {
     private openai: OpenAI;
-    private conversationHistory: any[] = [];
+    private conversationHistory: ConversationMessage[] = [];
     private totalTokens: TokenUsage = { input: 0, output: 0 };
     private currentModel: string;
     private webSearchEnabled: boolean;
@@ -671,7 +697,11 @@ System:
             this.conversationHistory = parsed.messages || [];
             this.totalTokens = parsed.tokens || { input: 0, output: 0 };
             console.log(`Loaded ${this.conversationHistory.length} messages from history.`);
-        } catch {
+        } catch (err) {
+            // Log error in debug mode, but continue with empty history
+            if (this._debug) {
+                console.error(chalk.dim('[Debug] History load failed:'), err);
+            }
             this.conversationHistory = [];
         }
     }
@@ -769,8 +799,8 @@ System:
     /**
      * Prepare messages for API call, ensuring we stay under token limits
      */
-    private prepareMessagesForAPI(): any[] {
-        const systemPrompt = { role: 'system', content: this.buildSystemPrompt() };
+    private prepareMessagesForAPI(): ChatCompletionMessageParam[] {
+        const systemPrompt: ChatCompletionMessageParam = { role: 'system', content: this.buildSystemPrompt() };
 
         // Trim conversation history to token limit
         const trimmedHistory = this.trimToTokenLimit(this.conversationHistory, MAX_CONTEXT_TOKENS);
@@ -814,6 +844,9 @@ System:
             console.log('Project structure loaded.');
         } catch (err) {
             console.log('Could not generate project map.');
+            if (this._debug && err) {
+                console.error(chalk.dim('[Debug] Project map error:'), err);
+            }
         }
     }
 
@@ -966,12 +999,28 @@ System:
 
                     for (const toolCall of toolCalls) {
                         const functionName = toolCall.function.name;
-                        let functionArgs: any = {};
+                        let functionArgs: Record<string, unknown> = {};
+                        let jsonParseError = false;
                         try {
                             functionArgs = JSON.parse(toolCall.function.arguments || '{}');
-                        } catch {
-                            functionArgs = {};
+                        } catch (parseError: unknown) {
+                            jsonParseError = true;
+                            const errorMsg = parseError instanceof Error ? parseError.message : 'Unknown parse error';
+                            // Report JSON parse error to LLM so it can retry with valid JSON
+                            const toolMessage = {
+                                role: 'tool' as const,
+                                tool_call_id: toolCall.id,
+                                name: functionName,
+                                content: `Error: Invalid JSON arguments provided. Parse error: ${errorMsg}. Please retry with valid JSON.`,
+                            };
+                            messages.push(toolMessage);
+                            this.conversationHistory.push(toolMessage);
+                            console.log(formatToolResult(`JSON parse error: ${errorMsg}`, false));
+                            continue;
                         }
+
+                        // Skip if JSON parsing failed (already handled above)
+                        if (jsonParseError) continue;
 
                         console.log(formatToolCall(functionName, functionArgs));
 
@@ -1003,13 +1052,25 @@ System:
                                 } else {
                                     this.status.showApproved();
                                     this.status.setState('executing', functionName);
-                                    toolOutput = await availableTools[functionName](validation.data);
+                                    try {
+                                        toolOutput = await availableTools[functionName](validation.data);
+                                    } catch (toolError: unknown) {
+                                        const errMsg = toolError instanceof Error ? toolError.message : String(toolError);
+                                        toolOutput = `Tool execution failed unexpectedly: ${errMsg}`;
+                                        toolSuccess = false;
+                                    }
                                     this.status.stopSpinner();
                                 }
                             } else {
                                 // Auto-approved tool execution
                                 this.status.setState('executing', functionName);
-                                toolOutput = await availableTools[functionName](validation.data);
+                                try {
+                                    toolOutput = await availableTools[functionName](validation.data);
+                                } catch (toolError: unknown) {
+                                    const errMsg = toolError instanceof Error ? toolError.message : String(toolError);
+                                    toolOutput = `Tool execution failed unexpectedly: ${errMsg}`;
+                                    toolSuccess = false;
+                                }
                                 this.status.stopSpinner();
                             }
                         } else {
@@ -1021,7 +1082,7 @@ System:
                         console.log(formatToolResult(toolOutput, toolSuccess));
 
                         const toolMessage = {
-                            role: 'tool',
+                            role: 'tool' as const,
                             tool_call_id: toolCall.id,
                             name: functionName,
                             content: toolOutput,

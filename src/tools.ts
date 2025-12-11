@@ -158,9 +158,116 @@ async function checkFileSize(filePath: string): Promise<{ ok: boolean; size: num
             };
         }
         return { ok: true, size: stats.size };
-    } catch (error: any) {
-        return { ok: false, size: 0, error: `Cannot access file: ${error.message}` };
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return { ok: false, size: 0, error: `Cannot access file: ${message}` };
     }
+}
+
+// ============================================================================
+// SECURITY VALIDATORS
+// ============================================================================
+
+/**
+ * Sensitive file patterns that should not be accessible.
+ * Blocks access to secrets, credentials, and system files.
+ */
+const SENSITIVE_FILE_PATTERNS = [
+    /^\.env(\.local|\.production|\.development)?$/i,  // Environment files
+    /^\.env\..+$/i,                                    // Any .env variant
+    /id_rsa|id_ed25519|id_ecdsa/i,                    // SSH private keys
+    /\.pem$/i,                                         // Certificate files
+    /\.key$/i,                                         // Key files
+    /credentials/i,                                    // Credential files
+    /secrets?\.ya?ml$/i,                              // Secret configs
+];
+
+/**
+ * Validate that a file path is safe to access.
+ * - Must be within the working directory
+ * - Must not access sensitive files
+ */
+export function validatePath(inputPath: string): { valid: boolean; resolvedPath: string; error?: string } {
+    const workingDir = process.cwd();
+
+    try {
+        // Resolve the path relative to working directory
+        const resolved = path.resolve(workingDir, inputPath);
+
+        // Ensure the resolved path is within the working directory
+        const relative = path.relative(workingDir, resolved);
+
+        // If the relative path starts with '..' or is absolute, it's outside the working dir
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+            return {
+                valid: false,
+                resolvedPath: resolved,
+                error: `Path traversal blocked: "${inputPath}" resolves outside the working directory`
+            };
+        }
+
+        // Check against sensitive file patterns
+        const filename = path.basename(resolved);
+        for (const pattern of SENSITIVE_FILE_PATTERNS) {
+            if (pattern.test(filename)) {
+                return {
+                    valid: false,
+                    resolvedPath: resolved,
+                    error: `Access denied: "${filename}" is a sensitive file`
+                };
+            }
+        }
+
+        return { valid: true, resolvedPath: resolved };
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return {
+            valid: false,
+            resolvedPath: inputPath,
+            error: `Invalid path: ${message}`
+        };
+    }
+}
+
+/**
+ * Dangerous command patterns that should be blocked or warned about.
+ */
+const DANGEROUS_COMMAND_PATTERNS: Array<{ pattern: RegExp; reason: string; block: boolean }> = [
+    // High danger - always block
+    { pattern: /rm\s+(-rf?|--recursive).*\s*[\/\\]($|\s)/i, reason: 'Recursive delete on root/sensitive path', block: true },
+    { pattern: /sudo\s+/i, reason: 'Privilege escalation attempt', block: true },
+    { pattern: />\s*\/dev\//i, reason: 'Writing to device files', block: true },
+    { pattern: /mkfs\s+/i, reason: 'Filesystem formatting', block: true },
+    { pattern: /dd\s+if=/i, reason: 'Low-level disk operations', block: true },
+    { pattern: /format\s+[a-z]:/i, reason: 'Disk formatting on Windows', block: true },
+
+    // Medium danger - warn but allow (user will see confirmation prompt anyway)
+    { pattern: /[;&|`$()]/, reason: 'Command chaining/substitution detected', block: false },
+    { pattern: /\brm\s+-rf?\s+\*/, reason: 'Wildcard deletion', block: false },
+];
+
+/**
+ * Validate that a command is safe to execute.
+ * Returns validation result with reason if blocked.
+ */
+export function validateCommand(command: string): { valid: boolean; warnings: string[]; error?: string } {
+    const warnings: string[] = [];
+
+    for (const { pattern, reason, block } of DANGEROUS_COMMAND_PATTERNS) {
+        if (pattern.test(command)) {
+            if (block) {
+                return {
+                    valid: false,
+                    warnings: [],
+                    error: `Command blocked: ${reason}. Command: "${command.slice(0, 50)}${command.length > 50 ? '...' : ''}"`
+                };
+            } else {
+                warnings.push(reason);
+            }
+        }
+    }
+
+    return { valid: true, warnings };
 }
 
 function createDiff(oldContent: string, newContent: string, filePath: string): string {
@@ -196,7 +303,9 @@ async function createBackup(filePath: string): Promise<string | null> {
             await fs.copyFile(filePath, backupPath);
             return backupPath;
         }
-    } catch { }
+    } catch {
+        // Backup failed - not critical, continue without backup
+    }
     return null;
 }
 
@@ -222,7 +331,9 @@ async function loadGitignorePatterns(dir: string): Promise<string[]> {
                 }
             }
         }
-    } catch { }
+    } catch {
+        // Gitignore parsing failed - continue with empty patterns
+    }
     return patterns;
 }
 
@@ -381,8 +492,9 @@ async function readFile({ path: filePath, start_line, end_line, show_line_number
             return lines.map((line, i) => `${i + 1} | ${line}`).join('\n');
         }
         return content;
-    } catch (error: any) {
-        return `Error reading file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error reading file: ${message}`;
     }
 }
 
@@ -422,8 +534,9 @@ async function readFileWithLines({ path: filePath, start_line, end_line }: { pat
             : `All ${totalLines} lines`;
 
         return `File: ${filePath}\n${rangeInfo}\n${'─'.repeat(60)}\n${lines.join('\n')}`;
-    } catch (error: any) {
-        return `Error reading file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error reading file: ${message}`;
     }
 }
 
@@ -438,13 +551,19 @@ async function editFileByLines({ path: filePath, start_line, end_line, new_conte
     new_content: string
 }) {
     try {
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
         // Validate line range
         if (start_line > end_line) {
             return `Error: start_line (${start_line}) must be <= end_line (${end_line})`;
         }
 
         // Read original content
-        const originalContent = await fs.readFile(filePath, 'utf-8');
+        const originalContent = await fs.readFile(pathCheck.resolvedPath, 'utf-8');
         const originalLines = originalContent.split('\n');
         const totalLines = originalLines.length;
 
@@ -457,7 +576,7 @@ async function editFileByLines({ path: filePath, start_line, end_line, new_conte
         }
 
         // Create backup
-        await createBackup(filePath);
+        await createBackup(pathCheck.resolvedPath);
 
         // Split new content into lines (handle empty content = delete lines)
         const newLines = new_content === '' ? [] : new_content.split('\n');
@@ -470,7 +589,7 @@ async function editFileByLines({ path: filePath, start_line, end_line, new_conte
         ];
 
         const newContent = resultLines.join('\n');
-        await fs.writeFile(filePath, newContent, 'utf-8');
+        await fs.writeFile(pathCheck.resolvedPath, newContent, 'utf-8');
 
         // Generate diff
         const diff = createDiff(originalContent, newContent, filePath);
@@ -485,46 +604,72 @@ async function editFileByLines({ path: filePath, start_line, end_line, new_conte
             `Replaced lines ${start_line}-${end_line} (${linesRemoved} lines) with ${linesAdded} lines (${deltaStr} net)\n` +
             `New file has ${resultLines.length} lines\n\n` +
             `Diff:\n${diff}`;
-    } catch (error: any) {
-        return `Error editing file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error editing file: ${message}`;
     }
 }
 
 async function writeFile({ path: filePath, content }: { path: string; content: string }) {
     try {
-        await createBackup(filePath);
-        const dir = path.dirname(filePath);
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        await createBackup(pathCheck.resolvedPath);
+        const dir = path.dirname(pathCheck.resolvedPath);
         await fs.mkdir(dir, { recursive: true });
-        await fs.writeFile(filePath, content, 'utf-8');
+        await fs.writeFile(pathCheck.resolvedPath, content, 'utf-8');
         return `Successfully wrote to ${filePath}`;
-    } catch (error: any) {
-        return `Error writing file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error writing file: ${message}`;
     }
 }
 
 async function deleteFile({ path: filePath, recursive = false }: { path: string; recursive?: boolean }) {
     try {
-        const stat = await fs.stat(filePath);
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const stat = await fs.stat(pathCheck.resolvedPath);
         if (stat.isDirectory()) {
-            await fs.rm(filePath, { recursive });
+            await fs.rm(pathCheck.resolvedPath, { recursive });
             return `Successfully deleted directory: ${filePath}`;
         } else {
-            await fs.unlink(filePath);
+            await fs.unlink(pathCheck.resolvedPath);
             return `Successfully deleted file: ${filePath}`;
         }
-    } catch (error: any) {
-        return `Error deleting: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error deleting: ${message}`;
     }
 }
 
 async function moveFile({ source, destination }: { source: string; destination: string }) {
     try {
-        const destDir = path.dirname(destination);
+        // Validate both paths
+        const sourceCheck = validatePath(source);
+        if (!sourceCheck.valid) {
+            return `Error: Source - ${sourceCheck.error}`;
+        }
+        const destCheck = validatePath(destination);
+        if (!destCheck.valid) {
+            return `Error: Destination - ${destCheck.error}`;
+        }
+
+        const destDir = path.dirname(destCheck.resolvedPath);
         await fs.mkdir(destDir, { recursive: true });
-        await fs.rename(source, destination);
+        await fs.rename(sourceCheck.resolvedPath, destCheck.resolvedPath);
         return `Successfully moved ${source} to ${destination}`;
-    } catch (error: any) {
-        return `Error moving file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error moving file: ${message}`;
     }
 }
 
@@ -543,8 +688,9 @@ async function getFileInfo({ path: filePath }: { path: string }) {
             modified: stat.mtime.toISOString(),
             created: stat.birthtime.toISOString(),
         }, null, 2);
-    } catch (error: any) {
-        return `Error getting file info: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error getting file info: ${message}`;
     }
 }
 
@@ -554,13 +700,19 @@ async function getFileInfo({ path: filePath }: { path: string }) {
 
 async function editFile({ path: filePath, old_text, new_text, replace_all = false }: { path: string; old_text: string; new_text: string; replace_all?: boolean }) {
     try {
-        const content = await fs.readFile(filePath, 'utf-8');
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const content = await fs.readFile(pathCheck.resolvedPath, 'utf-8');
 
         if (!content.includes(old_text)) {
             return `Error: The specified old_text was not found in ${filePath}`;
         }
 
-        await createBackup(filePath);
+        await createBackup(pathCheck.resolvedPath);
 
         const occurrences = content.split(old_text).length - 1;
         let newContent: string;
@@ -571,13 +723,14 @@ async function editFile({ path: filePath, old_text, new_text, replace_all = fals
             newContent = content.replace(old_text, new_text);
         }
 
-        await fs.writeFile(filePath, newContent, 'utf-8');
+        await fs.writeFile(pathCheck.resolvedPath, newContent, 'utf-8');
 
         const diff = createDiff(content, newContent, filePath);
         const replacedCount = replace_all ? occurrences : 1;
         return `Edited ${filePath}: replaced ${replacedCount} occurrence(s)\n\nDiff:\n${diff}`;
-    } catch (error: any) {
-        return `Error editing file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error editing file: ${message}`;
     }
 }
 
@@ -588,8 +741,14 @@ interface EditOperation {
 
 async function multiEditFile({ path: filePath, edits }: { path: string; edits: EditOperation[] }) {
     try {
-        const originalContent = await fs.readFile(filePath, 'utf-8');
-        await createBackup(filePath);
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const originalContent = await fs.readFile(pathCheck.resolvedPath, 'utf-8');
+        await createBackup(pathCheck.resolvedPath);
 
         let content = originalContent;
         const results: string[] = [];
@@ -606,19 +765,26 @@ async function multiEditFile({ path: filePath, edits }: { path: string; edits: E
             results.push(`Edit ${i + 1}: OK`);
         }
 
-        await fs.writeFile(filePath, content, 'utf-8');
+        await fs.writeFile(pathCheck.resolvedPath, content, 'utf-8');
 
         const diff = createDiff(originalContent, content, filePath);
         return `Edited ${filePath}:\n${results.join('\n')}\n\nDiff:\n${diff}`;
-    } catch (error: any) {
-        return `Error editing file: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error editing file: ${message}`;
     }
 }
 
 async function insertAtLine({ path: filePath, line_number, content: insertContent, position = 'after' }: { path: string; line_number: number; content: string; position?: 'before' | 'after' }) {
     try {
-        const originalContent = await fs.readFile(filePath, 'utf-8');
-        await createBackup(filePath);
+        // Validate path security
+        const pathCheck = validatePath(filePath);
+        if (!pathCheck.valid) {
+            return `Error: ${pathCheck.error}`;
+        }
+
+        const originalContent = await fs.readFile(pathCheck.resolvedPath, 'utf-8');
+        await createBackup(pathCheck.resolvedPath);
 
         const lines = originalContent.split('\n');
         const insertIndex = position === 'before' ? line_number - 1 : line_number;
@@ -630,11 +796,12 @@ async function insertAtLine({ path: filePath, line_number, content: insertConten
         lines.splice(insertIndex, 0, insertContent);
         const newContent = lines.join('\n');
 
-        await fs.writeFile(filePath, newContent, 'utf-8');
+        await fs.writeFile(pathCheck.resolvedPath, newContent, 'utf-8');
 
         return `Inserted content ${position} line ${line_number} in ${filePath}`;
-    } catch (error: any) {
-        return `Error inserting at line: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error inserting at line: ${message}`;
     }
 }
 
@@ -646,6 +813,17 @@ async function insertAtLine({ path: filePath, line_number, content: insertConten
 const MAX_OUTPUT_LENGTH = 50000;
 
 async function executeCommand({ command, cwd, timeout = 60000 }: { command: string; cwd?: string; timeout?: number }): Promise<string> {
+    // Validate command for dangerous patterns
+    const cmdCheck = validateCommand(command);
+    if (!cmdCheck.valid) {
+        return `Error: ${cmdCheck.error}`;
+    }
+
+    // Show warnings for potentially risky commands (but allow them - user sees confirmation anyway)
+    if (cmdCheck.warnings.length > 0) {
+        console.log(`\n⚠️  Command warnings: ${cmdCheck.warnings.join(', ')}`);
+    }
+
     return new Promise((resolve) => {
         console.log('\n[Command Output]');
         const child = spawn(command, {
@@ -738,8 +916,9 @@ async function listDirectory({ directory, recursive = false, show_size = false }
 
         await listDir(directory);
         return results.join('\n') || 'Empty directory';
-    } catch (error: any) {
-        return `Error listing directory: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error listing directory: ${message}`;
     }
 }
 
@@ -771,8 +950,9 @@ async function findFiles({ pattern, directory, max_results = 50 }: { pattern: st
 
         await searchDir(directory);
         return results.join('\n') || 'No files found matching pattern';
-    } catch (error: any) {
-        return `Error finding files: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error finding files: ${message}`;
     }
 }
 
@@ -824,8 +1004,9 @@ async function searchFiles({ pattern, directory, regex = false, extensions }: { 
 
         await searchDir(directory);
         return results.join('\n') || 'No matches found';
-    } catch (error: any) {
-        return `Error searching files: ${error.message}`;
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        return `Error searching files: ${message}`;
     }
 }
 
