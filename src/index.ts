@@ -62,7 +62,7 @@ async function handleCommand(input: string): Promise<boolean> {
 
         case '/refresh':
             console.log(chalk.cyan('Refreshing project structure...'));
-            await agent.refreshProjectMap();
+            await agent.refreshProjectMap(true); // Force refresh, bypass cache
             console.log(chalk.green('✓ Project structure refreshed.'));
             return true;
 

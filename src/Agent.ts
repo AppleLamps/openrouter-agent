@@ -324,6 +324,10 @@ export class Agent {
     private rl: readline.Interface | null = null;
     private status: StatusDisplay = new StatusDisplay();
 
+    // Project map caching
+    private projectMapCacheTime: number = 0;
+    private readonly PROJECT_MAP_CACHE_TTL = 300000; // 5 minutes
+
     constructor(config: AgentConfig = {}) {
         this.currentModel = config.model || process.env.OPENROUTER_MODEL || 'mistralai/devstral-2512:free';
         this.webSearchEnabled = config.webSearchEnabled || false;
@@ -630,32 +634,40 @@ System:
     /**
      * Trim messages to stay under token limit.
      * Removes oldest messages first while preserving recent context.
+     * Optimized: calculates how many messages to remove in bulk instead of one-at-a-time.
      */
     private trimToTokenLimit(messages: any[], maxTokens: number): any[] {
         // Reserve tokens for system prompt (estimate ~1500 tokens for safety)
         const systemPromptReserve = 1500;
         const availableTokens = maxTokens - systemPromptReserve;
 
-        let estimatedTokens = this.estimateMessagesTokens(messages);
+        const estimatedTokens = this.estimateMessagesTokens(messages);
 
         if (estimatedTokens <= availableTokens) {
             return messages;
         }
 
-        // Need to trim - remove oldest messages first
-        const trimmedMessages = [...messages];
-        let removed = 0;
+        // Calculate average tokens per message for bulk estimation
+        const avgTokensPerMessage = messages.length > 0 ? estimatedTokens / messages.length : 0;
 
-        while (estimatedTokens > availableTokens && trimmedMessages.length > 1) {
-            // Remove the oldest message
-            trimmedMessages.shift();
-            removed++;
-            estimatedTokens = this.estimateMessagesTokens(trimmedMessages);
+        if (avgTokensPerMessage === 0) {
+            return messages;
         }
 
-        if (removed > 0) {
-            console.log(`\n[Context Management] Removed ${removed} oldest message(s) to stay under token limit.`);
-            console.log(`[Context Management] Estimated tokens: ${estimatedTokens} / ${availableTokens} available`);
+        // Calculate how many messages to remove
+        const excessTokens = estimatedTokens - availableTokens;
+        const messagesToRemove = Math.min(
+            Math.ceil(excessTokens / avgTokensPerMessage),
+            messages.length - 1 // Keep at least 1 message
+        );
+
+        // Remove oldest messages in bulk
+        const trimmedMessages = messages.slice(messagesToRemove);
+
+        if (messagesToRemove > 0) {
+            const finalTokens = this.estimateMessagesTokens(trimmedMessages);
+            console.log(`\n[Context Management] Removed ${messagesToRemove} oldest message(s) to stay under token limit.`);
+            console.log(`[Context Management] Estimated tokens: ${finalTokens} / ${availableTokens} available`);
         }
 
         return trimmedMessages;
@@ -692,10 +704,20 @@ System:
 
     /**
      * Regenerate the project map (useful after file changes)
+     * @param forceRefresh - If true, ignores cache and regenerates
      */
-    async refreshProjectMap(): Promise<void> {
+    async refreshProjectMap(forceRefresh: boolean = false): Promise<void> {
+        const now = Date.now();
+
+        // Use cached map if still valid and not forcing refresh
+        if (!forceRefresh && this.projectMap && now - this.projectMapCacheTime < this.PROJECT_MAP_CACHE_TTL) {
+            console.log('Project structure loaded (cached).');
+            return;
+        }
+
         try {
             this.projectMap = await generateProjectMap(process.cwd());
+            this.projectMapCacheTime = now;
             console.log('Project structure loaded.');
         } catch (err) {
             console.log('Could not generate project map.');

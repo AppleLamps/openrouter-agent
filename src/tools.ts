@@ -140,6 +140,29 @@ export function validateToolArgs(toolName: string, args: unknown): { success: tr
 // UTILITY FUNCTIONS
 // ============================================================================
 
+// Maximum file size to read (10MB) - prevents memory issues with huge files
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+/**
+ * Check if a file is too large to read safely
+ */
+async function checkFileSize(filePath: string): Promise<{ ok: boolean; size: number; error?: string }> {
+    try {
+        const stats = await fs.stat(filePath);
+        if (stats.size > MAX_FILE_SIZE) {
+            const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+            return {
+                ok: false,
+                size: stats.size,
+                error: `File too large (${sizeMB}MB). Maximum allowed size is ${MAX_FILE_SIZE / (1024 * 1024)}MB. Use line ranges to read portions of large files.`
+            };
+        }
+        return { ok: true, size: stats.size };
+    } catch (error: any) {
+        return { ok: false, size: 0, error: `Cannot access file: ${error.message}` };
+    }
+}
+
 function createDiff(oldContent: string, newContent: string, filePath: string): string {
     // Use the diff library for robust unified diff output
     const patch = Diff.createTwoFilesPatch(
@@ -322,7 +345,7 @@ export async function generateProjectMap(dir: string, maxDepth: number = 4, maxF
 async function readFile({ path: filePath, start_line, end_line, show_line_numbers = false }: { path: string; start_line?: number; end_line?: number; show_line_numbers?: boolean }) {
     try {
         if (start_line !== undefined || end_line !== undefined) {
-            // Read specific lines
+            // Read specific lines - streaming, so no size check needed
             const fileStream = createReadStream(filePath);
             const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
 
@@ -344,6 +367,12 @@ async function readFile({ path: filePath, start_line, end_line, show_line_number
             }
 
             return lines.join('\n') || 'No lines in specified range';
+        }
+
+        // Check file size before reading entire file into memory
+        const sizeCheck = await checkFileSize(filePath);
+        if (!sizeCheck.ok) {
+            return `Error: ${sizeCheck.error}`;
         }
 
         const content = await fs.readFile(filePath, 'utf-8');
