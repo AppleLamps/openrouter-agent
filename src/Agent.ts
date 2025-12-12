@@ -7,6 +7,7 @@ import ora, { Ora } from 'ora';
 import chalk from 'chalk';
 import { highlight } from 'cli-highlight';
 import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap, readOnlyTools, READ_ONLY_TOOL_NAMES } from './tools';
+import { clamp, getTerminalColumns, prefixLines, renderBox, renderMarkdownToTerminal, renderPlainToTerminal } from './ui';
 
 // Configuration
 const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
@@ -15,13 +16,139 @@ const MAX_CONTEXT_TOKENS = 100000; // Safe limit for context window
 const CHARS_PER_TOKEN = 3.5; // Conservative estimate: ~3.5 chars per token (code has more syntax overhead)
 
 // ============================================================================
+// TERMINAL WIDTH + STREAMED OUTPUT WRAPPING
+// ============================================================================
+
+type StreamingMode = 'live' | 'final';
+
+interface UiConfig {
+    maxWidth: number; // preferred content width (not full terminal width)
+    markdown: boolean; // render markdown as rich terminal output
+    streaming: StreamingMode; // live in-place updates vs render at end
+    showLegendOnStartup: boolean; // show status legend at startup
+}
+
+const DEFAULT_UI: UiConfig = {
+    maxWidth: 92,
+    markdown: true,
+    streaming: 'live',
+    showLegendOnStartup: false,
+};
+
+// Single-agent CLI → module-level config is fine and keeps wiring simple.
+let UI: UiConfig = { ...DEFAULT_UI };
+
+/**
+ * We intentionally do NOT use the full terminal width for assistant responses.
+ * A smaller max line length is easier to read and avoids edge-to-edge "wall of text".
+ */
+function getPreferredResponseWidth(): number {
+    const cols = getTerminalColumns();
+    const maxWidth = UI.maxWidth; // readable on wide terminals (user-configurable)
+    const sideGutter = 6; // prefix + breathing room
+    return clamp(Math.min(maxWidth, cols - sideGutter), 40, maxWidth);
+}
+
+function renderAssistantMarkdown(markdown: string): string {
+    const width = getPreferredResponseWidth();
+    const rendered = UI.markdown ? renderMarkdownToTerminal(markdown, width) : renderPlainToTerminal(markdown, width);
+    return prefixLines(rendered, chalk.dim('│ '));
+}
+
+/**
+ * Live, in-place renderer for streamed assistant markdown.
+ * Uses readline cursor movement to redraw the assistant panel without spamming the scrollback.
+ *
+ * IMPORTANT:
+ * - Only enabled when stdout is a TTY.
+ * - Throttled to avoid excessive rendering work.
+ */
+class LiveAssistantRenderer {
+    private readonly render: (markdown: string) => string;
+    private readonly throttleMs: number;
+    private latestMarkdown: string = '';
+    private scheduled: NodeJS.Timeout | null = null;
+    private lastRenderedLineCount: number = 0;
+    private active: boolean = false;
+    private lastRenderAt: number = 0;
+
+    constructor(opts: { render: (markdown: string) => string; throttleMs?: number }) {
+        this.render = opts.render;
+        this.throttleMs = opts.throttleMs ?? 60;
+    }
+
+    start(): void {
+        if (!process.stdout.isTTY) return;
+        this.active = true;
+        this.lastRenderedLineCount = 0;
+        this.lastRenderAt = 0;
+    }
+
+    update(markdown: string): void {
+        if (!this.active || !process.stdout.isTTY) return;
+        this.latestMarkdown = markdown;
+
+        if (this.scheduled) return;
+
+        const now = Date.now();
+        const elapsed = now - this.lastRenderAt;
+        const delay = elapsed >= this.throttleMs ? 0 : (this.throttleMs - elapsed);
+
+        this.scheduled = setTimeout(() => {
+            this.scheduled = null;
+            this.flush();
+        }, delay);
+    }
+
+    flush(): void {
+        if (!this.active || !process.stdout.isTTY) return;
+
+        const output = this.render(this.latestMarkdown || '');
+        const lines = output.length ? output.split('\n').length : 1;
+
+        // Rewind cursor to the top of the previous render, then clear down.
+        if (this.lastRenderedLineCount > 0) {
+            readline.cursorTo(process.stdout, 0);
+            // Move up (lineCount - 1) lines to reach the first line of the block.
+            readline.moveCursor(process.stdout, 0, -(this.lastRenderedLineCount - 1));
+            readline.clearScreenDown(process.stdout);
+        }
+
+        process.stdout.write(output);
+        this.lastRenderedLineCount = lines;
+        this.lastRenderAt = Date.now();
+    }
+
+    /**
+     * Finalize the render (flush latest content) and leave cursor after the block.
+     */
+    done(): void {
+        if (!this.active) return;
+
+        if (this.scheduled) {
+            clearTimeout(this.scheduled);
+            this.scheduled = null;
+        }
+
+        if (process.stdout.isTTY) {
+            this.flush();
+            process.stdout.write('\n');
+        }
+
+        this.active = false;
+        this.lastRenderedLineCount = 0;
+        this.latestMarkdown = '';
+    }
+}
+
+// ============================================================================
 // STATUS & UI HELPERS
 // ============================================================================
 
 /**
  * Agent states for visual feedback
  */
-type AgentState = 'idle' | 'thinking' | 'streaming' | 'tool_calling' | 'executing' | 'complete' | 'error';
+type AgentState = 'idle' | 'thinking' | 'streaming' | 'tool_calling' | 'executing' | 'waiting' | 'complete' | 'error';
 
 /**
  * Status display manager for rich visual feedback
@@ -32,6 +159,7 @@ class StatusDisplay {
     private stepCount: number = 0;
     private totalToolCalls: number = 0;
     private streamingChars: number = 0;
+    private currentState: AgentState = 'idle';
 
     /**
      * Format elapsed time in human readable format
@@ -82,6 +210,7 @@ class StatusDisplay {
      */
     setState(state: AgentState, context?: string): void {
         this.stopSpinner();
+        this.currentState = state;
 
         switch (state) {
             case 'thinking':
@@ -93,7 +222,7 @@ class StatusDisplay {
                 break;
 
             case 'streaming':
-                // Don't use spinner for streaming - we'll update inline
+                // Phase 3: the agent can render streaming output inline (no spinner to avoid conflicts).
                 this.streamingChars = 0;
                 break;
 
@@ -111,6 +240,14 @@ class StatusDisplay {
                     text: chalk.magenta(`⚡ Executing: ${context || 'tool'}...`),
                     spinner: 'bouncingBar',
                     color: 'magenta'
+                }).start();
+                break;
+
+            case 'waiting':
+                this.spinner = ora({
+                    text: chalk.cyan(`⏳ Waiting ${context || 'for user input'}...`),
+                    spinner: 'dots',
+                    color: 'cyan'
                 }).start();
                 break;
 
@@ -163,7 +300,11 @@ class StatusDisplay {
      */
     showStepHeader(): void {
         if (this.stepCount > 1) {
-            console.log(chalk.dim(`\n─── Step ${this.stepCount} ───────────────────────────────────────────`));
+            const cols = getTerminalColumns();
+            const contentWidth = Math.max(36, Math.min(UI.maxWidth, cols - 6));
+            const label = ` Step ${this.stepCount} `;
+            const fill = Math.max(0, contentWidth - label.length);
+            console.log(chalk.dim('\n' + '─'.repeat(2) + label + '─'.repeat(fill)));
         }
     }
 
@@ -263,7 +404,13 @@ function formatToolCall(name: string, args: any): string {
                 : lines.map(l => l.length > 60 ? l.slice(0, 57) + '...' : l).join('\n');
     }
 
-    return `\n${chalk.dim('┌─')} ${chalk.yellow('🔧 ' + name)} ${chalk.dim('─'.repeat(Math.max(0, 45 - name.length)) + '┐')}\n${summary}\n${chalk.dim('└' + '─'.repeat(54) + '┘')}`;
+    const width = getPreferredResponseWidth();
+    return '\n' + renderBox({
+        title: `🔧 ${name}`,
+        width,
+        tint: chalk.dim,
+        content: summary.split('\n').map(l => l.trimEnd()),
+    });
 }
 
 /**
@@ -300,7 +447,13 @@ function formatToolResult(output: string, success: boolean = true, maxLength: nu
     const icon = success ? '📋' : '❌';
     const color = success ? chalk.dim : chalk.red;
 
-    return `\n${color('┌─')} ${icon} ${success ? chalk.dim('Result') : chalk.red('Error')} ${color('─'.repeat(43) + '┐')}\n${colorizedOutput}\n${color('└' + '─'.repeat(54) + '┘')}`
+    const width = getPreferredResponseWidth();
+    return '\n' + renderBox({
+        title: `${icon} ${success ? 'Result' : 'Error'}`,
+        width,
+        tint: color,
+        content: String(colorizedOutput).split('\n'),
+    });
 }
 
 interface TokenUsage {
@@ -394,6 +547,40 @@ export class Agent {
             baseURL: 'https://openrouter.ai/api/v1',
             apiKey: config.apiKey || process.env.OPENROUTER_API_KEY,
         });
+    }
+
+    // ============================================================================
+    // UI CONFIG
+    // ============================================================================
+
+    getUiConfig(): UiConfig {
+        return { ...UI };
+    }
+
+    resetUiConfig(): UiConfig {
+        UI = { ...DEFAULT_UI };
+        return this.getUiConfig();
+    }
+
+    setUiMaxWidth(width: number): UiConfig {
+        const w = clamp(Math.floor(width), 40, 140);
+        UI = { ...UI, maxWidth: w };
+        return this.getUiConfig();
+    }
+
+    setUiMarkdown(enabled: boolean): UiConfig {
+        UI = { ...UI, markdown: enabled };
+        return this.getUiConfig();
+    }
+
+    setUiStreaming(mode: StreamingMode): UiConfig {
+        UI = { ...UI, streaming: mode };
+        return this.getUiConfig();
+    }
+
+    setShowLegendOnStartup(enabled: boolean): UiConfig {
+        UI = { ...UI, showLegendOnStartup: enabled };
+        return this.getUiConfig();
     }
 
     // ============================================================================
@@ -561,26 +748,20 @@ export class Agent {
                 details = '';
         }
 
+        const width = getPreferredResponseWidth();
+        const lines: string[] = [
+            `${chalk.bold('Operation:')} ${operationType}`,
+            `${chalk.bold('Target:')}    ${targetPath || '(none)'}`,
+        ];
+        if (details) lines.push(`${chalk.bold('Details:')}   ${details}`);
+
         console.log('');
-        console.log('┌────────────────────────────────────────────────────────────┐');
-        console.log('│  ⚠️   DANGEROUS OPERATION - Confirmation Required          │');
-        console.log('├────────────────────────────────────────────────────────────┤');
-        console.log(`│  Operation: ${operationType.padEnd(46)}│`);
-
-        // Handle long paths by truncating
-        const displayPath = targetPath.length > 50
-            ? '...' + targetPath.slice(-47)
-            : targetPath;
-        console.log(`│  Target:    ${displayPath.padEnd(46)}│`);
-
-        if (details) {
-            const displayDetails = details.length > 46
-                ? details.slice(0, 43) + '...'
-                : details;
-            console.log(`│  Details:   ${displayDetails.padEnd(46)}│`);
-        }
-
-        console.log('└────────────────────────────────────────────────────────────┘');
+        console.log(renderBox({
+            title: '⚠️  Confirmation Required',
+            width,
+            tint: chalk.dim,
+            content: lines,
+        }));
 
         // Pause the main readline if it exists to prevent double input
         if (this.rl) {
@@ -648,6 +829,80 @@ export class Agent {
         });
     }
 
+    /**
+     * Ask user a question and return their response.
+     * This is called when the LLM uses the ask_user tool.
+     */
+    private async askUser(question: string): Promise<string> {
+        // Pause the main readline if it exists to prevent double input
+        if (this.rl) {
+            this.rl.pause();
+        }
+
+        // Display the question in a styled box
+        console.log('');
+        console.log(renderBox({
+            title: '❓ Agent Question',
+            width: getPreferredResponseWidth(),
+            tint: chalk.cyan,
+            content: [question],
+        }));
+
+        return new Promise((resolve) => {
+            const inputRl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: false,
+            });
+
+            process.stdout.write(chalk.cyan('Your response: '));
+
+            inputRl.once('line', (answer) => {
+                inputRl.close();
+
+                // Resume the main readline
+                if (this.rl) {
+                    this.rl.resume();
+                }
+
+                console.log(''); // Add some spacing
+                resolve(answer.trim() || '(no response provided)');
+            });
+        });
+    }
+
+    /**
+     * Simple prompt for user input without the styled box.
+     * Used as a fallback when we detect the LLM asked a question without using ask_user.
+     */
+    private async askUserSimple(): Promise<string> {
+        // Pause the main readline if it exists to prevent double input
+        if (this.rl) {
+            this.rl.pause();
+        }
+
+        return new Promise((resolve) => {
+            const inputRl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: false,
+            });
+
+            process.stdout.write(chalk.cyan('↩︎ '));
+
+            inputRl.once('line', (answer) => {
+                inputRl.close();
+
+                // Resume the main readline
+                if (this.rl) {
+                    this.rl.resume();
+                }
+
+                resolve(answer);
+            });
+        });
+    }
+
     // ============================================================================
     // SYSTEM PROMPT
     // ============================================================================
@@ -703,6 +958,27 @@ Search & Navigation:
 System:
 - execute_command: Run shell commands (supports cwd, timeout)
 
+User Interaction:
+- ask_user: Ask the user a question and wait for their response. Use this when you need:
+  • Clarification about requirements or preferences
+  • Confirmation before performing significant/destructive operations
+  • Input that was missing from the original request
+  • The user to choose between multiple approaches
+
+=== IMPORTANT: USER INTERACTION ===
+When you need user input, ALWAYS use the ask_user tool. DO NOT:
+- End your response with a question and expect a reply
+- Output questions as regular text without calling ask_user
+
+WRONG (this will NOT work - conversation ends immediately):
+"Would you like me to proceed with this change?"
+
+CORRECT (use the ask_user tool):
+<thought>I should ask the user if they want to proceed.</thought>
+[Call ask_user tool with question: "Would you like me to proceed with this change?"]
+
+If you ask a question without using ask_user, the conversation will end and the user won't be able to respond!
+
 === EDITING WORKFLOW ===
 1. Use read_file_with_lines to view the file with line numbers
 2. Identify the exact start_line and end_line you need to modify
@@ -716,6 +992,8 @@ System:
 - Explore the codebase before making changes
 - Backups are created automatically - don't worry about data loss
 - If a command fails, analyze the error and try to fix it
+- ALWAYS use ask_user tool when you need clarification, confirmation, or user choice
+- If you want to offer the user options, USE ask_user - don't just list them as text
 `;
     }
 
@@ -966,6 +1244,8 @@ System:
                 let fullContent = '';
                 let toolCalls: any[] = [];
                 let hasToolCalls = false;
+                let assistantContentRendered = false;
+                const live = new LiveAssistantRenderer({ render: renderAssistantMarkdown, throttleMs: 60 });
 
                 for await (const chunk of response) {
                     const delta = chunk.choices[0]?.delta;
@@ -974,13 +1254,16 @@ System:
                         // First content received - transition to streaming state
                         if (!streamStarted) {
                             this.status.setState('streaming');
-                            this.status.printStreamStart();
                             streamStarted = true;
+                            if (UI.streaming === 'live') live.start();
                         }
 
-                        process.stdout.write(delta.content);
                         fullContent += delta.content;
                         this.status.updateStreaming(delta.content.length);
+                        if (UI.streaming === 'live' && process.stdout.isTTY) {
+                            // Live re-render the rich markdown panel in place.
+                            live.update(fullContent);
+                        }
                     }
 
                     if (delta?.tool_calls) {
@@ -988,6 +1271,14 @@ System:
                         if (!hasToolCalls) {
                             this.status.stopSpinner();
                             hasToolCalls = true;
+                            // Freeze the live output before printing tool boxes beneath it.
+                            if (UI.streaming === 'live' && streamStarted && process.stdout.isTTY) {
+                                live.done();
+                                assistantContentRendered = true;
+                            } else if (streamStarted && fullContent && !assistantContentRendered) {
+                                console.log(renderAssistantMarkdown(fullContent));
+                                assistantContentRendered = true;
+                            }
                         }
 
                         for (const tcDelta of delta.tool_calls) {
@@ -1016,9 +1307,7 @@ System:
                 }
 
                 // If we were streaming, show the end indicator
-                if (streamStarted && fullContent) {
-                    this.status.printStreamEnd();
-                }
+                if (streamStarted) this.status.stopSpinner();
 
                 const assistantMessage: any = {
                     role: 'assistant',
@@ -1065,6 +1354,13 @@ System:
                         if (!validation.success) {
                             toolOutput = validation.error;
                             toolSuccess = false;
+                        } else if (functionName === 'ask_user') {
+                            // Special handling for ask_user tool - prompt user for input
+                            this.status.setState('waiting', 'for user input');
+                            toolOutput = await this.askUser(validation.data.question);
+                            this.status.stopSpinner();
+                            // Display the user's response
+                            console.log(formatToolResult(`User responded: ${toolOutput}`, true));
                         } else if (availableTools[functionName]) {
                             // Determine if we need confirmation based on safety level
                             let needsConfirmation = false;
@@ -1124,15 +1420,53 @@ System:
                         this.conversationHistory.push(toolMessage);
                     }
                 } else {
-                    // No tools called, we are done
+                    // No tools called - check if LLM is asking a question (fallback for models that don't use ask_user)
                     messages.push(assistantMessage);
                     this.conversationHistory.push(assistantMessage);
 
-                    // Apply syntax highlighting to code blocks in final response
-                    if (fullContent) {
-                        const hasCodeBlocks = fullContent.includes('```');
-                        if (hasCodeBlocks) {
-                            console.log('\n' + formatResponseWithHighlighting(fullContent));
+                    // Phase 1 UI cleanup:
+                    // We intentionally avoid re-printing the full response after streaming,
+                    // since it causes confusing duplicate output (raw streamed text + formatted reprint).
+                    if (fullContent && !assistantContentRendered) {
+                        if (UI.streaming === 'live' && process.stdout.isTTY && streamStarted) {
+                            live.done();
+                        } else {
+                            console.log(renderAssistantMarkdown(fullContent));
+                        }
+                        assistantContentRendered = true;
+                    }
+
+                    // Check if the response appears to be asking a question or soliciting input
+                    // This is a fallback for models that don't properly use the ask_user tool
+                    const trimmedContent = (fullContent || '').trim();
+                    const lastSentence = trimmedContent.slice(-200); // Check last 200 chars
+                    const appearsToAskQuestion =
+                        lastSentence.includes('?') ||
+                        /would you like/i.test(lastSentence) ||
+                        /do you want/i.test(lastSentence) ||
+                        /should i/i.test(lastSentence) ||
+                        /shall i/i.test(lastSentence) ||
+                        /let me know/i.test(lastSentence) ||
+                        /please (confirm|respond|reply)/i.test(lastSentence);
+
+                    if (appearsToAskQuestion) {
+                        // LLM seems to be asking for input - prompt user to continue
+                        console.log(chalk.dim(`\n📊 Tokens: ${this.totalTokens.input.toLocaleString()} in / ${this.totalTokens.output.toLocaleString()} out`));
+                        console.log(chalk.cyan('\n💬 The assistant appears to be waiting for your response.'));
+                        console.log(chalk.dim('   Type your response below, or press Enter to end the conversation.\n'));
+
+                        // Get user response
+                        const userResponse = await this.askUserSimple();
+
+                        if (userResponse.trim()) {
+                            // User provided input - add it and continue the loop
+                            this.conversationHistory.push({ role: 'user', content: userResponse });
+                            messages.push({ role: 'user', content: userResponse });
+                            continue; // Continue the agent loop with the new input
+                        } else {
+                            // Empty response - user wants to end
+                            this.status.setState('complete');
+                            break;
                         }
                     }
 
@@ -1270,6 +1604,8 @@ Estimated tool calls: [number]
                 let fullContent = '';
                 let toolCalls: any[] = [];
                 let hasToolCalls = false;
+                let assistantContentRendered = false;
+                const live = new LiveAssistantRenderer({ render: renderAssistantMarkdown, throttleMs: 60 });
 
                 for await (const chunk of response) {
                     const delta = chunk.choices[0]?.delta;
@@ -1277,18 +1613,27 @@ Estimated tool calls: [number]
                     if (delta?.content) {
                         if (!streamStarted) {
                             this.status.setState('streaming');
-                            this.status.printStreamStart();
                             streamStarted = true;
+                            if (UI.streaming === 'live') live.start();
                         }
-                        process.stdout.write(delta.content);
                         fullContent += delta.content;
                         this.status.updateStreaming(delta.content.length);
+                        if (UI.streaming === 'live' && process.stdout.isTTY) {
+                            live.update(fullContent);
+                        }
                     }
 
                     if (delta?.tool_calls) {
                         if (!hasToolCalls) {
                             this.status.stopSpinner();
                             hasToolCalls = true;
+                            if (UI.streaming === 'live' && streamStarted && process.stdout.isTTY) {
+                                live.done();
+                                assistantContentRendered = true;
+                            } else if (streamStarted && fullContent && !assistantContentRendered) {
+                                console.log(renderAssistantMarkdown(fullContent));
+                                assistantContentRendered = true;
+                            }
                         }
 
                         for (const tcDelta of delta.tool_calls) {
@@ -1316,7 +1661,7 @@ Estimated tool calls: [number]
                 }
 
                 if (streamStarted && fullContent) {
-                    this.status.printStreamEnd();
+                    this.status.stopSpinner();
                 }
 
                 const assistantMessage: any = {
@@ -1367,6 +1712,12 @@ Estimated tool calls: [number]
 
                         if (!validation.success) {
                             toolOutput = validation.error;
+                        } else if (functionName === 'ask_user') {
+                            // Special handling for ask_user tool - prompt user for input
+                            this.status.setState('waiting', 'for user input');
+                            toolOutput = await this.askUser(validation.data.question);
+                            this.status.stopSpinner();
+                            console.log(formatToolResult(`User responded: ${toolOutput}`, true, 200));
                         } else if (availableTools[functionName]) {
                             this.status.setState('executing', functionName);
                             try {
@@ -1393,6 +1744,15 @@ Estimated tool calls: [number]
                 } else {
                     // No tool calls - LLM has finished and should have output the plan
                     messages.push(assistantMessage);
+
+                    if (fullContent && !assistantContentRendered) {
+                        if (UI.streaming === 'live' && process.stdout.isTTY && streamStarted) {
+                            live.done();
+                        } else {
+                            console.log(renderAssistantMarkdown(fullContent));
+                        }
+                        assistantContentRendered = true;
+                    }
 
                     // Check if the response contains a plan
                     if (fullContent && (fullContent.includes('EXECUTION PLAN') || fullContent.includes('Steps:'))) {

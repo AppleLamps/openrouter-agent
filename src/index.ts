@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import chalk from 'chalk';
 import { Agent } from './Agent';
+import { getTerminalColumns, renderBanner, renderBox } from './ui';
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
@@ -27,7 +28,7 @@ function validateEnvironment(): void {
 validateEnvironment();
 
 // Available commands for tab-completion
-const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', '/plan', '/run', 'exit'];
+const COMMANDS = ['/model', '/web', '/tokens', '/clear', '/safe', '/refresh', '/help', '/cls', '/config', '/cost', '/map', '/debug', '/ui', '/plan', '/run', 'exit'];
 
 // History file path
 const HISTORY_PATH = path.join(process.cwd(), '.ora_history');
@@ -148,6 +149,87 @@ async function handleCommand(input: string): Promise<boolean> {
             console.log(`Debug mode: ${debugState ? chalk.green('ON') : chalk.yellow('OFF')}`);
             return true;
 
+        case '/ui': {
+            // /ui
+            // /ui width 80
+            // /ui markdown on|off
+            // /ui stream live|final
+            // /ui legend on|off
+            // /ui reset
+            const sub = (parts[1] || '').toLowerCase();
+            const arg = (parts[2] || '').toLowerCase();
+
+            if (!sub) {
+                const ui = agent.getUiConfig();
+                console.log('');
+                console.log(chalk.bold.cyan('UI Settings:'));
+                console.log(`  ${chalk.cyan('Width:')}     ${chalk.white(String(ui.maxWidth))}`);
+                console.log(`  ${chalk.cyan('Markdown:')}  ${ui.markdown ? chalk.green('ON') : chalk.yellow('OFF')}`);
+                console.log(`  ${chalk.cyan('Streaming:')} ${chalk.white(ui.streaming.toUpperCase())}`);
+                console.log(`  ${chalk.cyan('Legend:')}    ${ui.showLegendOnStartup ? chalk.green('ON') : chalk.yellow('OFF')} ${chalk.dim('(startup)')}`);
+                console.log('');
+                console.log(chalk.dim('Usage:'));
+                console.log(chalk.dim('  /ui width <40-140>'));
+                console.log(chalk.dim('  /ui markdown on|off'));
+                console.log(chalk.dim('  /ui stream live|final'));
+                console.log(chalk.dim('  /ui legend on|off   (takes effect on restart)'));
+                console.log(chalk.dim('  /ui reset'));
+                console.log('');
+                return true;
+            }
+
+            if (sub === 'reset') {
+                agent.resetUiConfig();
+                console.log(chalk.green('✓ UI settings reset to defaults.'));
+                return true;
+            }
+
+            if (sub === 'width') {
+                const width = Number(parts[2]);
+                if (!Number.isFinite(width)) {
+                    console.log(chalk.yellow('Usage: /ui width <number>'));
+                    return true;
+                }
+                const ui = agent.setUiMaxWidth(width);
+                console.log(chalk.green(`✓ UI width set to: ${ui.maxWidth}`));
+                return true;
+            }
+
+            if (sub === 'markdown') {
+                if (arg !== 'on' && arg !== 'off') {
+                    console.log(chalk.yellow('Usage: /ui markdown on|off'));
+                    return true;
+                }
+                const ui = agent.setUiMarkdown(arg === 'on');
+                console.log(ui.markdown ? chalk.green('✓ Markdown rendering: ON') : chalk.yellow('○ Markdown rendering: OFF'));
+                return true;
+            }
+
+            if (sub === 'stream') {
+                if (arg !== 'live' && arg !== 'final') {
+                    console.log(chalk.yellow('Usage: /ui stream live|final'));
+                    return true;
+                }
+                const ui = agent.setUiStreaming(arg as any);
+                console.log(chalk.green(`✓ Streaming mode: ${ui.streaming.toUpperCase()}`));
+                return true;
+            }
+
+            if (sub === 'legend') {
+                if (arg !== 'on' && arg !== 'off') {
+                    console.log(chalk.yellow('Usage: /ui legend on|off'));
+                    return true;
+                }
+                const ui = agent.setShowLegendOnStartup(arg === 'on');
+                console.log(ui.showLegendOnStartup ? chalk.green('✓ Startup legend: ON') : chalk.yellow('○ Startup legend: OFF'));
+                console.log(chalk.dim('  (Takes effect next restart)'));
+                return true;
+            }
+
+            console.log(chalk.yellow('Unknown /ui subcommand. Run /ui for help.'));
+            return true;
+        }
+
         case '/plan':
             const planTask = parts.slice(1).join(' ');
             if (!planTask) {
@@ -189,6 +271,7 @@ ${chalk.bold.cyan('Available Commands:')}
   ${chalk.yellow('/refresh')}       - Refresh project structure map
   ${chalk.yellow('/map')}           - View the current project structure
   ${chalk.yellow('/debug')}         - Toggle debug mode (show API payloads)
+  ${chalk.yellow('/ui')}            - UI settings (width/markdown/streaming)
   ${chalk.yellow('/plan')} ${chalk.dim('<task>')}  - Create execution plan (read-only exploration)
   ${chalk.yellow('/run')}           - Execute the pending plan
   ${chalk.yellow('/help')} ${chalk.dim('(/h)')}     - Show this help message
@@ -253,34 +336,38 @@ async function startREPL() {
 
     await agent.initialize();
 
-    // Pretty startup banner
+    const cols = getTerminalColumns();
+    const ui = agent.getUiConfig();
+    const contentWidth = Math.max(36, Math.min(ui.maxWidth, cols - 6));
+
     console.log('');
-    console.log(chalk.cyan.bold('╔══════════════════════════════════════════════════════════╗'));
-    console.log(chalk.cyan.bold('║') + chalk.white.bold('         🤖 OpenRouter CLI Agent v1.0                    ') + chalk.cyan.bold('║'));
-    console.log(chalk.cyan.bold('╚══════════════════════════════════════════════════════════╝'));
+    console.log(renderBanner('🤖 OpenRouter CLI Agent v1.0', contentWidth));
     console.log('');
 
-    // Configuration info
-    console.log(chalk.dim('┌─ Configuration ─────────────────────────────────────────┐'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Model:')}     ${chalk.white(agent.model.slice(0, 44).padEnd(44))}` + chalk.dim('│'));
     const safetyColors = { 'full': chalk.green, 'delete-only': chalk.yellow, 'off': chalk.red };
-    const safetyLabel = safetyColors[agent.safetyLevel](agent.safetyLevel.toUpperCase().padEnd(44));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Safety:')}    ${safetyLabel}` + chalk.dim('│'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Project:')}   ${chalk.white((agent.getProjectContext() || 'Unknown').slice(0, 44).padEnd(44))}` + chalk.dim('│'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('Directory:')} ${chalk.white(process.cwd().slice(-44).padEnd(44))}` + chalk.dim('│'));
-    console.log(chalk.dim('└─────────────────────────────────────────────────────────┘'));
+    const configLines = [
+        `${chalk.cyan('Model:')}     ${chalk.white(agent.model)}`,
+        `${chalk.cyan('Safety:')}    ${safetyColors[agent.safetyLevel](agent.safetyLevel.toUpperCase())}`,
+        `${chalk.cyan('Project:')}   ${chalk.white(agent.getProjectContext() || 'Unknown')}`,
+        `${chalk.cyan('Directory:')} ${chalk.white(process.cwd())}`,
+    ];
+    console.log(renderBox({ title: 'Configuration', width: contentWidth, tint: chalk.dim, content: configLines }));
     console.log('');
 
-    // Status legend - helps users understand what each indicator means
-    console.log(chalk.dim('┌─ Status Indicators ─────────────────────────────────────┐'));
-    console.log(chalk.dim('│') + ` ${chalk.cyan('🧠 Thinking')}   ${chalk.dim('- Processing your request')}          ${chalk.dim('│')}`);
-    console.log(chalk.dim('│') + ` ${chalk.white('│ ...')}        ${chalk.dim('- Streaming response text')}          ${chalk.dim('│')}`);
-    console.log(chalk.dim('│') + ` ${chalk.yellow('🔧 Tool')}       ${chalk.dim('- Calling a tool/function')}          ${chalk.dim('│')}`);
-    console.log(chalk.dim('│') + ` ${chalk.magenta('⚡ Executing')} ${chalk.dim('- Running tool operation')}           ${chalk.dim('│')}`);
-    console.log(chalk.dim('│') + ` ${chalk.green('✓ Complete')}   ${chalk.dim('- Task finished successfully')}        ${chalk.dim('│')}`);
-    console.log(chalk.dim('└─────────────────────────────────────────────────────────┘'));
-    console.log('');
+    if (ui.showLegendOnStartup) {
+        const legendLines = [
+            `${chalk.cyan('🧠 Thinking')}   ${chalk.dim('- Processing your request')}`,
+            `${chalk.white('│ ...')}        ${chalk.dim('- Streaming response')}`,
+            `${chalk.yellow('🔧 Tool')}       ${chalk.dim('- Calling a tool/function')}`,
+            `${chalk.magenta('⚡ Executing')} ${chalk.dim('- Running tool operation')}`,
+            `${chalk.green('✓ Complete')}   ${chalk.dim('- Task finished successfully')}`,
+        ];
+        console.log(renderBox({ title: 'Status Indicators', width: contentWidth, tint: chalk.dim, content: legendLines }));
+        console.log('');
+    }
+
     console.log(chalk.dim('Type') + chalk.yellow(' /help ') + chalk.dim('for commands,') + chalk.yellow(' exit ') + chalk.dim('to quit. Press') + chalk.cyan(' Tab ') + chalk.dim('for autocomplete.'));
+    console.log(chalk.dim(`UI: ${chalk.yellow('/ui')} to adjust width/streaming/markdown`));
     console.log('');
 
     const promptUser = () => {

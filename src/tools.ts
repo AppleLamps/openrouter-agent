@@ -100,6 +100,10 @@ export const SearchFilesSchema = z.object({
 
 export const GetCurrentDirectorySchema = z.object({});
 
+export const AskUserSchema = z.object({
+    question: z.string().min(1, 'Question is required'),
+});
+
 // Schema map for validation
 export const toolSchemas: Record<string, z.ZodSchema> = {
     read_file: ReadFileSchema,
@@ -117,6 +121,7 @@ export const toolSchemas: Record<string, z.ZodSchema> = {
     find_files: FindFilesSchema,
     search_files: SearchFilesSchema,
     get_current_directory: GetCurrentDirectorySchema,
+    ask_user: AskUserSchema,
 };
 
 // Validation helper that returns either validated args or an error string
@@ -1298,6 +1303,20 @@ export const tools = [
     {
         type: 'function',
         function: {
+            name: 'ask_user',
+            description: 'Ask the user a question and wait for their response. Use this when you need clarification, confirmation, or additional information before proceeding. The user\'s response will be returned as the tool result. Examples: asking which approach they prefer, confirming before destructive operations, requesting missing information.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    question: { type: 'string', description: 'The question to ask the user. Be clear and specific about what information you need.' },
+                },
+                required: ['question'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'edit_file_by_lines',
             description: 'Replace a range of lines with new content. SAFER than string matching. Use read_file_with_lines first to identify exact line numbers. Supports deleting lines (empty new_content) or replacing with different number of lines.',
             parameters: {
@@ -1352,6 +1371,7 @@ export const READ_ONLY_TOOL_NAMES = [
     'search_files',
     'get_file_info',
     'get_current_directory',
+    'ask_user',  // User interaction, doesn't modify files
 ];
 
 /**

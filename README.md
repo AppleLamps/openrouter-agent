@@ -103,6 +103,7 @@ OPENROUTER_MODEL=mistralai/devstral-2512:free
 ```
 
 **Popular models:**
+
 - `anthropic/claude-3.5-sonnet` — Best for coding
 - `openai/gpt-4o` — Fast and capable
 - `mistralai/devstral-2512:free` — Free tier
@@ -219,7 +220,6 @@ The agent prompts for user confirmation before executing potentially dangerous o
 | **delete-only** | Only prompts for delete and execute commands |
 | **off** | No prompts (use with extreme caution!) |
 
-
 Toggle with `/safe` command.
 
 ### Tips
@@ -315,6 +315,7 @@ The agent is built with a clean separation of concerns:
 - **REPL** (`index.ts`) — Thin entry point handling user input, commands, and the main loop
 
 Key features:
+
 - **Streaming responses** — See output as it's generated
 - **Zod validation** — All tool arguments are validated before execution
 - **Automatic context management** — History is trimmed to stay under token limits
