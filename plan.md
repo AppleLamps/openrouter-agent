@@ -2,14 +2,14 @@
 
 ## Overview
 
-The current `src/tools.ts` file is over 800 lines and handles multiple responsibilities. This refactor will split it into a well-organized `tools/` directory for better maintainability.
+The current `src/tools.ts` file is ~1400 lines and handles multiple responsibilities. This refactor will split it into a well-organized `tools/` directory for better maintainability.
 
 ---
 
 ## Prompt for LLM (Cursor/Copilot)
 
-```
-Refactor src/tools.ts into a modular tools/ directory structure. The current file is ~850 lines and handles schemas, validation, security, file operations, edit operations, command execution, directory operations, and project detection.
+````text
+Refactor src/tools.ts into a modular tools/ directory structure. The current file is ~1400 lines and handles schemas, validation, security, file operations, edit operations, command execution, directory operations, project detection, and planning-mode/read-only tool exports.
 
 ### Target Structure
 
@@ -26,6 +26,7 @@ src/tools/
 ├── directory-ops.ts   # listDirectory, findFiles, searchFiles, getCurrentDirectory
 ├── command.ts         # executeCommand function
 ├── project.ts         # detectProjectType, generateProjectMap, loadGitignorePatterns, shouldIgnore
+├── planning.ts        # READ_ONLY_TOOL_NAMES and readOnlyTools
 └── definitions.ts     # tools array (OpenAI function definitions) and availableTools map
 
 ### Requirements
@@ -36,12 +37,15 @@ src/tools/
    - `detectProjectType`
    - `validateToolArgs`
    - `generateProjectMap`
+   - `readOnlyTools`
+   - `READ_ONLY_TOOL_NAMES`
 
 2. **index.ts should re-export everything**:
    ```typescript
    export { tools, availableTools } from './definitions';
    export { validateToolArgs } from './validation';
    export { detectProjectType, generateProjectMap } from './project';
+   export { readOnlyTools, READ_ONLY_TOOL_NAMES } from './planning';
    // Export schemas if needed elsewhere
    export * from './schemas';
    ```
@@ -59,10 +63,10 @@ src/tools/
 
    ```typescript
    // Before
-   import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap } from './tools';
+   import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap, readOnlyTools, READ_ONLY_TOOL_NAMES } from './tools';
    
    // After (should work the same due to index.ts)
-   import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap } from './tools';
+   import { tools, availableTools, detectProjectType, validateToolArgs, generateProjectMap, readOnlyTools, READ_ONLY_TOOL_NAMES } from './tools';
    ```
 
 ### File Content Guide
@@ -71,6 +75,8 @@ src/tools/
 
 - All `z.object()` schema definitions
 - Export each schema individually
+
+Note: includes `TaskCompleteSchema`.
 
 **validation.ts** (~30 lines)
 
@@ -133,6 +139,8 @@ src/tools/
 - `tools` array (OpenAI function definitions)
 - `availableTools` map (imports all operation functions)
 
+Note: includes the `task_complete` tool definition.
+
 ### Verification
 
 After refactoring:
@@ -143,14 +151,14 @@ After refactoring:
 
 Do NOT delete src/tools.ts until the new structure is verified working.
 
-```
+````
 
 ---
 
 ## Manual Checklist
 
 - [ ] Create `src/tools/` directory
-- [ ] Create all 11 files listed above
+- [ ] Create all 12 files listed above
 - [ ] Verify `npm run build` passes
 - [ ] Test agent functionality with `npm run dev`
 - [ ] Delete old `src/tools.ts` after verification

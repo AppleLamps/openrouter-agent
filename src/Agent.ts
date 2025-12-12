@@ -14,6 +14,8 @@ const HISTORY_FILE = path.join(process.cwd(), '.agent_history.json');
 const MAX_HISTORY_MESSAGES = 50;
 const MAX_CONTEXT_TOKENS = 100000; // Safe limit for context window
 const CHARS_PER_TOKEN = 3.5; // Conservative estimate: ~3.5 chars per token (code has more syntax overhead)
+const MAX_TOOL_OUTPUT_HISTORY_CHARS = 1200;
+const MAX_TOOL_OUTPUT_CONTEXT_CHARS = 6000;
 
 // ============================================================================
 // TERMINAL WIDTH + STREAMED OUTPUT WRAPPING
@@ -763,30 +765,12 @@ export class Agent {
             content: lines,
         }));
 
-        // Pause the main readline if it exists to prevent double input
-        if (this.rl) {
-            this.rl.pause();
-        }
+        if (!this.rl) throw new Error('Readline interface not initialized');
 
-        // Create a fresh readline interface for the confirmation prompt
         return new Promise((resolve) => {
-            const confirmRl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout,
-                terminal: false, // Disable terminal features to prevent echo issues
-            });
-
-            process.stdout.write('Allow? (y/yes to confirm): ');
-
-            confirmRl.once('line', (answer) => {
-                confirmRl.close();
-
-                // Resume the main readline
-                if (this.rl) {
-                    this.rl.resume();
-                }
-
-                const confirmed = answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes';
+            this.rl!.question('Allow? (y/yes to confirm): ', (answer) => {
+                const normalized = (answer || '').toLowerCase().trim();
+                const confirmed = normalized === 'y' || normalized === 'yes';
                 if (confirmed) {
                     console.log('✓ Approved\n');
                 } else {
@@ -801,29 +785,12 @@ export class Agent {
      * Ask user if they want to continue after reaching max steps
      */
     private async askContinue(): Promise<boolean> {
-        // Pause the main readline if it exists to prevent double input
-        if (this.rl) {
-            this.rl.pause();
-        }
+        if (!this.rl) throw new Error('Readline interface not initialized');
 
         return new Promise((resolve) => {
-            const confirmRl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout,
-                terminal: false,
-            });
-
-            process.stdout.write(chalk.yellow('Continue? (y/yes to continue): '));
-
-            confirmRl.once('line', (answer) => {
-                confirmRl.close();
-
-                // Resume the main readline
-                if (this.rl) {
-                    this.rl.resume();
-                }
-
-                const shouldContinue = answer.toLowerCase().trim() === 'y' || answer.toLowerCase().trim() === 'yes';
+            this.rl!.question(chalk.yellow('Continue? (y/yes to continue): '), (answer) => {
+                const normalized = (answer || '').toLowerCase().trim();
+                const shouldContinue = normalized === 'y' || normalized === 'yes';
                 resolve(shouldContinue);
             });
         });
@@ -834,10 +801,7 @@ export class Agent {
      * This is called when the LLM uses the ask_user tool.
      */
     private async askUser(question: string): Promise<string> {
-        // Pause the main readline if it exists to prevent double input
-        if (this.rl) {
-            this.rl.pause();
-        }
+        if (!this.rl) throw new Error('Readline interface not initialized');
 
         // Display the question in a styled box
         console.log('');
@@ -849,24 +813,9 @@ export class Agent {
         }));
 
         return new Promise((resolve) => {
-            const inputRl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout,
-                terminal: false,
-            });
-
-            process.stdout.write(chalk.cyan('Your response: '));
-
-            inputRl.once('line', (answer) => {
-                inputRl.close();
-
-                // Resume the main readline
-                if (this.rl) {
-                    this.rl.resume();
-                }
-
+            this.rl!.question(chalk.cyan('Your response: '), (answer) => {
                 console.log(''); // Add some spacing
-                resolve(answer.trim() || '(no response provided)');
+                resolve((answer || '').trim() || '(no response provided)');
             });
         });
     }
@@ -876,31 +825,25 @@ export class Agent {
      * Used as a fallback when we detect the LLM asked a question without using ask_user.
      */
     private async askUserSimple(): Promise<string> {
-        // Pause the main readline if it exists to prevent double input
-        if (this.rl) {
-            this.rl.pause();
-        }
+        if (!this.rl) throw new Error('Readline interface not initialized');
 
         return new Promise((resolve) => {
-            const inputRl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout,
-                terminal: false,
-            });
-
-            process.stdout.write(chalk.cyan('↩︎ '));
-
-            inputRl.once('line', (answer) => {
-                inputRl.close();
-
-                // Resume the main readline
-                if (this.rl) {
-                    this.rl.resume();
-                }
-
-                resolve(answer);
+            this.rl!.question(chalk.cyan('↩︎ '), (answer) => {
+                resolve(answer || '');
             });
         });
+    }
+
+    private truncateToolOutputForHistory(toolName: string, output: string): string {
+        const suffix = `\n... [Output truncated. Use read_file_with_lines to see more]`;
+        if (output.length <= MAX_TOOL_OUTPUT_HISTORY_CHARS) return output;
+        return output.slice(0, MAX_TOOL_OUTPUT_HISTORY_CHARS) + suffix;
+    }
+
+    private truncateToolOutputForContext(toolName: string, output: string): string {
+        const suffix = `\n... [Output truncated. Use read_file_with_lines to see more]`;
+        if (output.length <= MAX_TOOL_OUTPUT_CONTEXT_CHARS) return output;
+        return output.slice(0, MAX_TOOL_OUTPUT_CONTEXT_CHARS) + suffix;
     }
 
     // ============================================================================
@@ -926,6 +869,13 @@ Let me start by reading the file with line numbers.
 </thought>
 
 Always think before acting. Never call a tool without a preceding <thought> block.
+
+=== CRITICAL RULES ===
+1. You have NO 'create_file' tool. You MUST use 'write_file'.
+2. You have NO 'mkdir' tool. 'write_file' automatically creates directories.
+3. Do not assume tools exist if they are not in the "Available Tools" list.
+4. Do not talk about actions you will take. If you intend to act, CALL A TOOL.
+5. When the user's request is fully satisfied, you MUST call task_complete.
 
 === PROJECT CONTEXT ===
 - Working Directory: ${process.cwd()}
@@ -964,6 +914,9 @@ User Interaction:
   • Confirmation before performing significant/destructive operations
   • Input that was missing from the original request
   • The user to choose between multiple approaches
+
+Completion:
+- task_complete: Call this ONLY when the user's request is fully satisfied.
 
 === IMPORTANT: USER INTERACTION ===
 When you need user input, ALWAYS use the ask_user tool. DO NOT:
@@ -1202,6 +1155,15 @@ If you ask a question without using ask_user, the conversation will end and the 
             currentStepInSession++;
             this.status.incrementStep();
 
+            // Reduce token usage for multi-step runs: truncate older tool outputs in the in-session context.
+            // Keep the newest few messages intact so the model can reason over the latest tool results.
+            for (let i = 0; i < Math.max(0, messages.length - 8); i++) {
+                const msg = messages[i];
+                if (msg?.role === 'tool' && typeof msg.content === 'string') {
+                    msg.content = this.truncateToolOutputForContext(msg.name || 'tool', msg.content);
+                }
+            }
+
             // Check if we've hit max steps for this session
             if (currentStepInSession > maxSteps) {
                 console.log(chalk.yellow(`\n⚠️ Reached maximum steps (${maxSteps}). Task may be incomplete.`));
@@ -1236,6 +1198,7 @@ If you ask a question without using ask_user, the conversation will end and the 
                         model: modelToUse,
                         messages: messages,
                         tools: tools as any,
+                        temperature: 0,
                         stream: true,
                     })
                 );
@@ -1318,6 +1281,9 @@ If you ask a question without using ask_user, the conversation will end and the 
                     assistantMessage.tool_calls = toolCalls;
                     messages.push(assistantMessage);
                     this.conversationHistory.push(assistantMessage);
+
+                    let completed = false;
+                    let completionSummary: string | null = null;
 
                     for (const toolCall of toolCalls) {
                         const functionName = toolCall.function.name;
@@ -1410,14 +1376,33 @@ If you ask a question without using ask_user, the conversation will end and the 
                         // Display formatted result with success/error indication
                         console.log(formatToolResult(toolOutput, toolSuccess));
 
-                        const toolMessage = {
+                        const fullToolMessage = {
                             role: 'tool' as const,
                             tool_call_id: toolCall.id,
                             name: functionName,
                             content: toolOutput,
                         };
-                        messages.push(toolMessage);
-                        this.conversationHistory.push(toolMessage);
+                        messages.push(fullToolMessage);
+
+                        const historyToolMessage = {
+                            ...fullToolMessage,
+                            content: this.truncateToolOutputForHistory(functionName, toolOutput),
+                        };
+                        this.conversationHistory.push(historyToolMessage);
+
+                        if (functionName === 'task_complete') {
+                            completed = true;
+                            completionSummary = (validation.success ? validation.data?.summary : null) || toolOutput || null;
+                        }
+                    }
+
+                    if (completed) {
+                        if (completionSummary && this._debug) {
+                            console.log(chalk.dim(`\n[Debug] task_complete summary: ${completionSummary}`));
+                        }
+                        console.log(chalk.dim(`\n📊 Tokens: ${this.totalTokens.input.toLocaleString()} in / ${this.totalTokens.output.toLocaleString()} out`));
+                        this.status.setState('complete');
+                        break;
                     }
                 } else {
                     // No tools called - check if LLM is asking a question (fallback for models that don't use ask_user)
@@ -1470,12 +1455,12 @@ If you ask a question without using ask_user, the conversation will end and the 
                         }
                     }
 
-                    // Display token usage for this session
-                    console.log(chalk.dim(`\n📊 Tokens: ${this.totalTokens.input.toLocaleString()} in / ${this.totalTokens.output.toLocaleString()} out`));
-
-                    // Show completion status
-                    this.status.setState('complete');
-                    break;
+                    // Model produced text but did not call a tool. Do not exit: force explicit completion.
+                    messages.push({
+                        role: 'system',
+                        content: 'You did not call a tool. If you are trying to perform an action, call the appropriate tool. If you are done, call task_complete.'
+                    });
+                    continue;
                 }
             } catch (error: any) {
                 this.status.setState('error', error.message || 'Unknown error');
@@ -1596,6 +1581,7 @@ Estimated tool calls: [number]
                         model: modelToUse,
                         messages: messages,
                         tools: readOnlyTools as any, // Only read-only tools!
+                        temperature: 0,
                         stream: true,
                     })
                 );

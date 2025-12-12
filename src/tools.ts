@@ -104,6 +104,10 @@ export const AskUserSchema = z.object({
     question: z.string().min(1, 'Question is required'),
 });
 
+export const TaskCompleteSchema = z.object({
+    summary: z.string().optional(),
+});
+
 // Schema map for validation
 export const toolSchemas: Record<string, z.ZodSchema> = {
     read_file: ReadFileSchema,
@@ -122,7 +126,12 @@ export const toolSchemas: Record<string, z.ZodSchema> = {
     search_files: SearchFilesSchema,
     get_current_directory: GetCurrentDirectorySchema,
     ask_user: AskUserSchema,
+    task_complete: TaskCompleteSchema,
 };
+
+async function taskComplete({ summary }: { summary?: string }) {
+    return summary || 'Task complete.';
+}
 
 // Validation helper that returns either validated args or an error string
 export function validateToolArgs(toolName: string, args: unknown): { success: true; data: any } | { success: false; error: string } {
@@ -1317,6 +1326,20 @@ export const tools = [
     {
         type: 'function',
         function: {
+            name: 'task_complete',
+            description: 'Call this ONLY when the user\'s request is fully satisfied. Optional: provide a summary.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    summary: { type: 'string', description: 'Brief summary of what was achieved.' }
+                },
+                required: [],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'edit_file_by_lines',
             description: 'Replace a range of lines with new content. SAFER than string matching. Use read_file_with_lines first to identify exact line numbers. Supports deleting lines (empty new_content) or replacing with different number of lines.',
             parameters: {
@@ -1353,6 +1376,8 @@ export const availableTools: Record<string, Function> = {
     find_files: findFiles,
     search_files: searchFiles,
     get_current_directory: getCurrentDirectory,
+    ask_user: async ({ question }: { question: string }) => question,
+    task_complete: taskComplete,
 };
 
 // ============================================================================
@@ -1372,6 +1397,7 @@ export const READ_ONLY_TOOL_NAMES = [
     'get_file_info',
     'get_current_directory',
     'ask_user',  // User interaction, doesn't modify files
+    'task_complete',
 ];
 
 /**
